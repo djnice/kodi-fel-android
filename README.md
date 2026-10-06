@@ -29,8 +29,9 @@ Releases: <https://github.com/djnice/kodi-fel-android/releases> (APK, read `READ
 
 ## Requirements
 
-- Amlogic S928X Dune HD or R_volution player with the Dune HD **R24** Android firmware.
-  Tested: Dune HD Pro One 8K Plus, firmware `260303_1721_r24`. One module build for all R24 firmware;
+- Amlogic S928X Dune HD or R_volution player with the Dune HD **R22 or R24** Android firmware.
+  Tested: Dune HD Pro One 8K Plus, firmware `260303_1721_r24`; Dune HD Pro 8K Plus, firmware
+  `250815_1012_r22`. One module build for all of them (no symbol version differences between these two);
   on other builds / models please report how it works (kodi.log `CAndroidDvFel` lines – they also list
   kernel symbols whose versions differ from the tested firmware).
 - Root access for the one-time module installation (the firmware's `sud`; Kodi FEL asks to switch it on
@@ -47,7 +48,8 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
    (`disagrees about version of symbol`) and loads it anyway – one build serves all firmware versions;
    such warnings are written to kodi.log (`tools/fwcheck.sh` lists them for a player over adb).
 3. The module goes to `<FS_PREFIX>/config/dvfel/dvfel.ko` and a boot script to
-   `<FS_PREFIX>/config/boot/dvfel.sh`, which the firmware's `binit.sh` runs as root at every boot.
+   `<FS_PREFIX>/config/boot/dvfel.sh`, which the firmware runs as root at every boot (R24: `binit.sh`,
+   R22: the `dunehd_init` service script `/system/xbin/dunehd/init` itself).
 
 ## Repository
 
@@ -70,7 +72,7 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 
 ## Status / known limits
 
-- Proof of concept: one firmware tested. 4K 50/60p FEL is too heavy (GPU time).
+- Proof of concept: two firmware versions / two models tested. 4K 50/60p FEL is too heavy (GPU time).
 - The Dune auto frame rate does not switch back after stop until you return to the Dune home screen.
 - After a seek, 1–2 frames may be shown with the RPU mapping only (no EL residual).
 - Kodi still drops a frame now and then (0–3 a minute measured), like without FEL: its clock and the
@@ -78,6 +80,9 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 
 ## Changes
 
+- **v0.1.3-poc** (module unchanged, `2026.10.06.2`): R22 firmware support – the installer also finds the
+  boot hook of R22 (`/system/xbin/dunehd/init`; v0.1.2 reported "no Dune HD firmware boot hook" there).
+  Tested on a Dune HD Pro 8K Plus with `250815_1012_r22`.
 - **v0.1.2-poc** (module `2026.10.06.2`):
   - EL decoder no longer loses pictures (each EL access unit now ends with its RPU as in a demuxed EL
     stream – before, the decoder timed out on some pictures, mostly at movie starts).

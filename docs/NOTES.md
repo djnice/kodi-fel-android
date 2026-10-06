@@ -83,4 +83,9 @@ kernel `5.4.210` GKI, Android 11 userdebug, SELinux permissive).
   signature changed (e.g. `struct vframe_s`): the first suspect if a firmware misbehaves. The installer
   logs them; `tools/fwcheck.sh` lists them for a player.
 - `<FS_PREFIX>` comes from `FSP=` in `/system/xbin/dunehd/init` (`/data/data/com.dunehd.app` on Dune);
-  `/system/dunehd/firmware/scripts/binit.sh` runs `<FS_PREFIX>/config/boot/*` as root at boot.
+  `/system/dunehd/firmware/scripts/binit.sh` (R24) or `/system/xbin/dunehd/init` itself (R22, the
+  `dunehd_init` service: root, `u:r:shell:s0`) runs the executables in `<FS_PREFIX>/config/boot/` at boot.
+  R22 (`250815_1012_r22`, kernel 5.4.210 of 2025-08-15) takes the same module without any symbol version
+  difference.
+- Files pushed with adb to `/sdcard/Download` are invisible to apps until the media scanner sees them
+  (Android 11 scoped storage); for tests put them into the app's own `Android/data/<package>/files/`.

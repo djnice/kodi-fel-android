@@ -384,7 +384,8 @@ namespace
 {
 // run as root by InstallModuleAsync: $1 = the bundled module. The Dune HD
 // firmware (Dune and R_volution players) runs every executable in
-// <FS_PREFIX>/config/boot as root at boot (binit.sh). One module build for all
+// <FS_PREFIX>/config/boot as root at boot (R24: binit.sh, R22: the
+// /system/xbin/dunehd/init service itself). One module build for all
 // firmware versions: their kernel only warns about symbol CRC mismatches
 // ("disagrees about version of symbol") and loads it anyway; the warnings go
 // to the log (a changed structure behind them would be the first suspect).
@@ -392,8 +393,8 @@ constexpr const char* INSTALL_SCRIPT = R"SH(#!/system/bin/sh
 KO="$1"
 FSP=$(sed -n 's/^FSP=//p' /system/xbin/dunehd/init 2>/dev/null | head -1)
 [ -n "$FSP" ] || FSP=/data/data/com.dunehd.app
-grep -q 'config/boot' /system/dunehd/firmware/scripts/binit.sh 2>/dev/null ||
-  { echo "no Dune HD firmware boot hook (binit.sh)"; exit 2; }
+grep -qs 'config/boot' /system/dunehd/firmware/scripts/binit.sh /system/xbin/dunehd/init ||
+  { echo "no Dune HD firmware boot hook (binit.sh, dunehd/init)"; exit 2; }
 D=$FSP/config
 [ -d "$D" ] || { echo "$D missing"; exit 2; }
 echo "firmware $(grep -h firmware_version "$D/last_fw_info.txt" 2>/dev/null), $(getprop ro.product.model), kernel $(uname -r)"

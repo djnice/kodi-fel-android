@@ -29,24 +29,24 @@ Releases: <https://github.com/djnice/kodi-fel-android/releases> (APK, read `READ
 ## Requirements
 
 - Amlogic S928X Dune HD or R_volution player with the Dune HD **R24** Android firmware.
-  Tested: Dune HD Pro One 8K Plus, firmware `260303_1721_r24`. Other R24 builds / models: the installer
-  checks the module and refuses it if it does not fit (please report: kodi.log `CAndroidDvFel` lines).
+  Tested: Dune HD Pro One 8K Plus, firmware `260303_1721_r24`. One module build for all R24 firmware;
+  on other builds / models please report how it works (kodi.log `CAndroidDvFel` lines – they also list
+  kernel symbols whose versions differ from the tested firmware).
 - Root access for the one-time module installation (the firmware's `sud`; Kodi FEL asks to switch it on
   for the installation and switches it off again).
 
 ## How the module gets installed
 
-Kodi FEL ("Kodi FEL", `org.xbmc.kodi.fel`, installs next to the official Kodi) carries `dvfel.ko`
-builds in its assets (`system/dvfel/variants.txt`). On start, if the module is not loaded (or older):
+Kodi FEL ("Kodi FEL", `org.xbmc.kodi.fel`, installs next to the official Kodi) carries `dvfel.ko` in
+its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 
 1. `su` – if the firmware's root access is off (`persist.vendor.root_access=0`, `sud` stopped), a Yes/No
    dialog asks to switch it on for the installation; the previous value is restored afterwards.
-2. Each bundled build is trial-loaded; the firmware kernel only **warns** about symbol CRC mismatches
-   (`disagrees about version of symbol`) and loads anyway, so a build fits only if loading it logged no
-   such warning, otherwise it is unloaded at once.
-3. The fitting build goes to `<FS_PREFIX>/config/dvfel/dvfel.ko` and a boot script to
-   `<FS_PREFIX>/config/boot/dvfel.sh`, which the firmware's `binit.sh` runs as root at every boot
-   (with the same CRC check, for firmware updates).
+2. The module is loaded. The firmware kernel only **warns** about symbol CRC mismatches
+   (`disagrees about version of symbol`) and loads it anyway – one build serves all firmware versions;
+   such warnings are written to kodi.log (`tools/fwcheck.sh` lists them for a player over adb).
+3. The module goes to `<FS_PREFIX>/config/dvfel/dvfel.ko` and a boot script to
+   `<FS_PREFIX>/config/boot/dvfel.sh`, which the firmware's `binit.sh` runs as root at every boot.
 
 ## Repository
 

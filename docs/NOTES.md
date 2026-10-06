@@ -55,6 +55,8 @@ kernel `5.4.210` GKI, Android 11 userdebug, SELinux permissive).
 - `su` (Koushik Superuser client) talks to the `sud` daemon, which runs while `persist.vendor.root_access`
   is empty (default) or `1`. On this permissive firmware an app may set that property itself.
 - Module symbol CRC mismatches only produce a warning (`disagrees about version of symbol`) – the module
-  loads anyway. The installer and the boot script therefore check the kernel log after `insmod`.
+  loads anyway, so one build serves all firmware versions. A mismatch means a type in that symbol's
+  signature changed (e.g. `struct vframe_s`): the first suspect if a firmware misbehaves. The installer
+  logs them; `tools/fwcheck.sh` lists them for a player.
 - `<FS_PREFIX>` comes from `FSP=` in `/system/xbin/dunehd/init` (`/data/data/com.dunehd.app` on Dune);
   `/system/dunehd/firmware/scripts/binit.sh` runs `<FS_PREFIX>/config/boot/*` as root at boot.

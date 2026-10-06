@@ -14,13 +14,11 @@ CEV=$(ls -d ~/ce22/CoreELEC/build.*/build/kodi-*/xbmc/cores/VideoPlayer/DVDCodec
 for f in AndroidDvFel.cpp AndroidDvFel.h; do sed 's/\r$//' $SRC/android/kodi/$f > $V/$f; done
 sed 's/\r$//' $SRC/kernel/dvfel_uapi.h > $V/dvfel_uapi.h
 cp $CEV/felgpu.c $CEV/felgpu.h $V/
-# the kernel module builds for the Dune HD 5.4 GKI firmware kernels, one per
-# CRC set (android/tools/kbuild.sh, fwcheck.sh); the installer tries them in
-# the order of variants.txt
+# the kernel module for the Dune HD 5.4 GKI firmware kernels (one build for
+# all; android/tools/kbuild.sh)
 mkdir -p $K/system/dvfel
 rm -f $K/system/dvfel/*
-cp ~/dvfel-android/dvfel/dvfel.ko $K/system/dvfel/dvfel-r24-260303.ko
-printf '# dvfel.ko builds, tried in this order\ndvfel-r24-260303.ko\n' > $K/system/dvfel/variants.txt
+cp ~/dvfel-android/dvfel/dvfel.ko $K/system/dvfel/dvfel.ko
 set +e	# the build steps report their own status
 case "$1" in
   build) cd ~/kodi-android/kodi-build && make -j14 2>&1 | grep -E " error|error:|Error [0-9]" | head -30; echo "make exit ${PIPESTATUS[0]}" ;;

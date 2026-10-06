@@ -25,10 +25,10 @@ index d20fd89223..cc5cf52f9c 100644
      <string name="suggestion_channel">Suggestions</string>
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AndroidDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AndroidDvFel.cpp
 new file mode 100644
-index 0000000000..9b510ab9fe
+index 0000000000..ac0495d11c
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AndroidDvFel.cpp
-@@ -0,0 +1,1656 @@
+@@ -0,0 +1,1617 @@
 +/*
 + *  Copyright (C) 2026 Team CoreELEC
 + *  This file is part of Kodi - https://kodi.tv
@@ -385,26 +385,14 @@ index 0000000000..9b510ab9fe
 +
 +namespace
 +{
-+// run as root by InstallModuleAsync: $@ = the bundled module builds (one per
-+// supported firmware kernel; the first one that fits is installed). The Dune
-+// HD firmware kernel only warns about symbol CRC mismatches ("disagrees about
-+// version of symbol") and loads the module anyway, so a build counts as
-+// fitting only if loading it logged no such warning; otherwise it is unloaded
-+// again at once (its init touches no Amlogic structures). The boot script
-+// repeats the check (a firmware update may change the kernel). The Dune HD
++// run as root by InstallModuleAsync: $1 = the bundled module. The Dune HD
 +// firmware (Dune and R_volution players) runs every executable in
-+// <FS_PREFIX>/config/boot as root at boot (binit.sh).
++// <FS_PREFIX>/config/boot as root at boot (binit.sh). One module build for all
++// firmware versions: their kernel only warns about symbol CRC mismatches
++// ("disagrees about version of symbol") and loads it anyway; the warnings go
++// to the log (a changed structure behind them would be the first suspect).
 +constexpr const char* INSTALL_SCRIPT = R"SH(#!/system/bin/sh
-+# load_checked <ko>: 0 loaded and fits, 1 insmod failed, 2 CRC mismatch (unloaded)
-+load_checked() {
-+  b=$(dmesg | grep -c 'dvfel: disagrees about version')
-+  insmod "$1" 2>/dev/null || return 1
-+  a=$(dmesg | grep -c 'dvfel: disagrees about version')
-+  [ "$a" -gt "$b" ] || return 0
-+  dmesg | grep 'dvfel: disagrees about version' | tail -n $((a - b)) | head -5
-+  rmmod dvfel
-+  return 2
-+}
++KO="$1"
 +FSP=$(sed -n 's/^FSP=//p' /system/xbin/dunehd/init 2>/dev/null | head -1)
 +[ -n "$FSP" ] || FSP=/data/data/com.dunehd.app
 +grep -q 'config/boot' /system/dunehd/firmware/scripts/binit.sh 2>/dev/null ||
@@ -419,38 +407,27 @@ index 0000000000..9b510ab9fe
 +if [ -d /sys/module/dvfel ]; then
 +  rmmod dvfel || { echo "the loaded module is in use, try again after a reboot"; exit 4; }
 +fi
-+OK=
-+for KO in "$@"; do
-+  load_checked "$KO"
-+  case $? in
-+    0) OK=$KO; break ;;
-+    1) echo "$(basename "$KO"): insmod failed"; dmesg | grep -i dvfel | tail -3 ;;
-+    2) echo "$(basename "$KO") does not fit this firmware (symbol versions above)" ;;
-+  esac
-+done
-+if [ -z "$OK" ]; then
-+  echo "no bundled module fits this firmware"
-+  [ -f "$INST" ] && load_checked "$INST" >/dev/null && echo "the installed module is loaded again"
++b=$(dmesg | grep -c 'dvfel: disagrees about version')
++if ! insmod "$KO"; then
++  echo "insmod failed:"
++  dmesg | grep -i dvfel | tail -3
++  [ -f "$INST" ] && insmod "$INST" 2>/dev/null && echo "the installed module is loaded again"
 +  exit 5
 +fi
-+echo "loaded $(basename "$OK")"
-+if ! cmp -s "$OK" "$INST"; then
-+  cp "$OK" "$INST.tmp" && chmod 644 "$INST.tmp" && mv "$INST.tmp" "$INST" || exit 6
++a=$(dmesg | grep -c 'dvfel: disagrees about version')
++if [ "$a" -gt "$b" ]; then
++  echo "note: symbol versions differ from the build firmware (loaded anyway):"
++  dmesg | grep 'dvfel: disagrees about version' | tail -n $((a - b)) | head -10
++fi
++if ! cmp -s "$KO" "$INST"; then
++  cp "$KO" "$INST.tmp" && chmod 644 "$INST.tmp" && mv "$INST.tmp" "$INST" || exit 6
 +  echo "module installed to $INST"
 +fi
 +
 +cat > "$D/boot/dvfel.sh.tmp" <<EOS
 +#!/system/bin/sh
 +# Kodi FEL: Dolby Vision FEL composition kernel module (dvfel)
-+b=\$(dmesg | grep -c 'dvfel: disagrees about version')
 +insmod $INST || exit 1
-+# the firmware kernel only warns about symbol version mismatches: a firmware
-+# update may need another module build (start Kodi FEL to install it)
-+if [ "\$(dmesg | grep -c 'dvfel: disagrees about version')" -gt "\$b" ]; then
-+  rmmod dvfel
-+  echo "dvfel: does not fit this firmware, unloaded"
-+  exit 2
-+fi
 +# ueventd creates the device node asynchronously
 +i=0
 +while [ ! -e /dev/dvfel ] && [ \$i -lt 50 ]; do sleep 0.1; i=\$((i + 1)); done
@@ -566,24 +543,8 @@ index 0000000000..9b510ab9fe
 +
 +    const std::string script = dir + "/dvfel_install.sh";
 +    const std::string declinedFile = DeclinedFile(dir);
-+    // the module builds, one per supported firmware kernel (variants.txt)
-+    std::string kos;
-+    {
-+      const std::string list = dir + "/dvfel_variants.txt";
-+      XFILE::CFile::Copy("special://xbmc/system/dvfel/variants.txt", list);
-+      std::ifstream f(list);
-+      std::string name;
-+      while (std::getline(f, name))
-+      {
-+        StringUtils::Trim(name);
-+        if (name.empty() || name[0] == '#')
-+          continue;
-+        const std::string ko = dir + "/" + name;
-+        if (XFILE::CFile::Copy("special://xbmc/system/dvfel/" + name, ko))
-+          kos += " " + ko;
-+      }
-+    }
-+    if (kos.empty())
++    const std::string ko = dir + "/dvfel.ko";
++    if (!XFILE::CFile::Copy("special://xbmc/system/dvfel/dvfel.ko", ko))
 +    {
 +      CLog::Log(LOGINFO, "CAndroidDvFel: no bundled kernel module");
 +      return;
@@ -655,7 +616,7 @@ index 0000000000..9b510ab9fe
 +      }
 +    }
 +
-+    const int rc = Run("timeout 90 su -c 'sh " + script + kos + "'", "module install");
++    const int rc = Run("timeout 90 su -c 'sh " + script + " " + ko + "'", "module install");
 +    if (switched)
 +    {
 +      Run(std::string("setprop ") + ROOT_PROP + " '" + previous + "'", "root access");

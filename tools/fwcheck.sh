@@ -7,8 +7,8 @@
 # version of symbol ...") and loads the module anyway, so the check is a trial
 # load: insmod, look for new warnings, rmmod. No warnings = the kernel and
 # Amlogic structures the module uses are unchanged (the CRCs cover them).
-# Warnings list the changed symbols: check those types, then build a variant
-# with that firmware's CRCs (modver.py db/symvers + kbuild.sh; the firmware's
+# Warnings list the changed symbols (Kodi FEL installs the module anyway): if
+# it misbehaves there, check those types first (modver.py db/symvers + kbuild.sh; the firmware's
 # vendor modules are pulled to ~/dunefw/fw/<firmware>_<model>/ for that, the
 # aml_media.ko exports come from the firmware image's vendor_boot ramdisk).
 set -e
@@ -51,7 +51,7 @@ else
   a=$(dmesg | grep -c "dvfel: disagrees about version")
   if [ "$a" -gt "$b" ]; then
     dmesg | grep "dvfel: disagrees about version" | tail -n $((a - b))
-    echo "RESULT: does NOT fit ($((a - b)) symbols differ)"
+    echo "RESULT: $((a - b)) symbol versions differ (the module loads anyway; check these structures if it misbehaves)"
   else
     echo "RESULT: fits"
   fi

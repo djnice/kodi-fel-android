@@ -1,0 +1,9 @@
+*.keystore
+*.pass
+*.apk
+*.ko
+*.o
+*.mod*
+.*.cmd
+Module.symvers
+modules.order

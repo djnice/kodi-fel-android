@@ -1,0 +1,119 @@
+diff --git a/xbmc/platform/android/activity/XBMCApp.cpp b/xbmc/platform/android/activity/XBMCApp.cpp
+index 7d1ab0f98c..b1f265ef68 100644
+--- a/xbmc/platform/android/activity/XBMCApp.cpp
++++ b/xbmc/platform/android/activity/XBMCApp.cpp
+@@ -249,6 +249,17 @@ void CXBMCApp::onStart()
+ 
+   if (m_firstrun)
+   {
++    // The activity may be stopped and started again while run() still waits
++    // for the main window (e.g. a launcher took the focus during startup):
++    // never start a second thread over a joinable one (std::terminate).
++    if (m_thread.joinable())
++    {
++      if (!m_runGaveUp)
++        return;
++      m_thread.join();
++    }
++    m_runGaveUp = false;
++
+     // Register sink
+     AE::CAESinkFactory::ClearSinks();
+     CAESinkAUDIOTRACK::Register();
+@@ -256,6 +267,10 @@ void CXBMCApp::onStart()
+     // Create thread to run Kodi main event loop
+     m_thread = std::thread(&CXBMCApp::run, this);
+ 
++    if (m_receiversRegistered)
++      return;
++    m_receiversRegistered = true;
++
+     // Some intent filters MUST be registered in code rather than through the manifest
+     CJNIIntentFilter intentFilter;
+     intentFilter.addAction(CJNIIntent::ACTION_BATTERY_CHANGED);
+@@ -662,7 +677,11 @@ void CXBMCApp::run()
+ 
+   // Wait for main window
+   if (!GetNativeWindow(30000))
++  {
++    android_printf(" => no main window, Kodi not started");
++    m_runGaveUp = true;
+     return;
++  }
+ 
+   m_firstrun = false;
+   android_printf(" => running XBMC_Run...");
+@@ -1360,6 +1379,13 @@ void CXBMCApp::OnWakeup()
+ 
+ void CXBMCApp::onNewIntent(CJNIIntent intent)
+ {
++  // Kodi is not running (yet), e.g. the activity went to the background
++  // during startup: neither logging nor the messenger exist
++  if (!CServiceBroker::IsLoggingUp() || !CServiceBroker::GetAppMessenger())
++  {
++    android_printf("CXBMCApp::onNewIntent - Kodi not running, intent ignored");
++    return;
++  }
+   if (!intent)
+   {
+     CLog::Log(LOGINFO, "CXBMCApp::onNewIntent - Got invalid intent.");
+@@ -1521,6 +1547,22 @@ void CXBMCApp::doFrame(int64_t frameTimeNanos)
+     m_syncImpl->FrameCallback(frameTimeNanos);
+ 
+   // Calculate the time, when next surface buffer should be rendered
++  if (m_lastFrameTimeNanos)
++  {
++    const int64_t delta = frameTimeNanos - m_lastFrameTimeNanos;
++    if (delta > 4000000 && delta < 100000000) // 10..250 Hz
++    {
++      m_frameDeltas[m_frameDeltaIdx++ % 16] = delta;
++      // the shortest recent interval: a missed callback doubles one
++      int64_t period = 0;
++      for (int64_t d : m_frameDeltas)
++        if (d && (!period || d < period))
++          period = d;
++      if (m_frameDeltaIdx >= 4)
++        m_vsyncPeriodNanos = period;
++    }
++  }
++  m_lastFrameTimeNanos = frameTimeNanos;
+   m_frameTimeNanos = frameTimeNanos;
+ 
+   m_vsyncEvent.Set();
+@@ -1528,6 +1570,9 @@ void CXBMCApp::doFrame(int64_t frameTimeNanos)
+ 
+ int64_t CXBMCApp::GetNextFrameTime() const
+ {
++  const int64_t period = m_vsyncPeriodNanos;
++  if (period > 0)
++    return m_frameTimeNanos + period * 3 / 2;
+   if (m_refreshRate > 0.0001f)
+     return m_frameTimeNanos + static_cast<int64_t>(1500000000ll / m_refreshRate);
+   else
+diff --git a/xbmc/platform/android/activity/XBMCApp.h b/xbmc/platform/android/activity/XBMCApp.h
+index a98e3b5ff9..24ab384894 100644
+--- a/xbmc/platform/android/activity/XBMCApp.h
++++ b/xbmc/platform/android/activity/XBMCApp.h
+@@ -253,6 +253,9 @@ private:
+   int m_exitCode{0};
+   bool m_bResumePlayback{false};
+   std::thread m_thread;
++  // run() returned without starting Kodi (no main window in time)
++  std::atomic<bool> m_runGaveUp{false};
++  bool m_receiversRegistered{false};
+   mutable CCriticalSection m_applicationsMutex;
+   mutable std::vector<androidPackage> m_applications;
+ 
+@@ -271,6 +274,12 @@ private:
+   uint32_t m_playback_state{0};
+   int64_t m_frameTimeNanos{0};
+   float m_refreshRate{0.0f};
++  // vsync period measured from the Choreographer callbacks: the output mode may be switched
++  // outside Kodi (e.g. the auto frame rate of the Dune HD firmware), m_refreshRate is then wrong
++  int64_t m_lastFrameTimeNanos{0};
++  int64_t m_frameDeltas[16]{};
++  unsigned int m_frameDeltaIdx{0};
++  std::atomic<int64_t> m_vsyncPeriodNanos{0};
+ 
+ public:
+   // CJNISurfaceHolderCallback interface

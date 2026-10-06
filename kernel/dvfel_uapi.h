@@ -31,7 +31,7 @@
 #include <linux/types.h>
 
 /* module version (/sys/module/dvfel/version); compositors may require a minimum */
-#define DVFEL_VERSION		"2026.10.05"
+#define DVFEL_VERSION		"2026.10.06.2"
 
 #define DVFEL_MAX_BUFS		4
 /* bytes needed per buffer (includes a write-MIF margin) */
@@ -83,7 +83,8 @@ struct dvfel_job2 {
 	 */
 	__u32 rpu_crc;
 	__u32 seq;			/* out: frames taken since the stream start */
-	__u32 reserved[2];
+	__u32 out;			/* out (DVFEL_IOC_REG_BUFS2): the lin_fd to compose into */
+	__u32 reserved[1];
 };
 
 #define DVFEL_DONE_COMPOSED	0	/* out[buf] holds the frame */
@@ -140,5 +141,26 @@ struct dvfel_el_import {
 };
 
 #define DVFEL_IOC_EL_IMPORT	_IOWR(DVFEL_IOC_MAGIC, 7, struct dvfel_el_import)
+
+/*
+ * DVFEL_IOC_REG_BUFS2: REG_BUFS where the display shows the compositor's
+ * frames directly (no AFBC conversion). out_fd[] of the base is unused; the
+ * compositor gives at least as many display buffers (lin_fd, same layout and
+ * size as in[]) as the module has slots (/sys/module/dvfel/parameters/slots).
+ * Each job names the one to write (dvfel_job2.out); the composed frame or,
+ * for DVFEL_DONE_PASSTHROUGH, nothing (dvfel copies in[buf] there). A
+ * display buffer may be on screen until the next jobs: the compositor never
+ * writes one outside of its job. Use DVFEL_IOC_WAIT_JOB2.
+ */
+#define DVFEL_MAX_OUT		12
+
+struct dvfel_reg_bufs2 {
+	struct dvfel_reg_bufs base;
+	__u32 out_count;
+	__s32 lin_fd[DVFEL_MAX_OUT];
+	__u32 reserved[4];
+};
+
+#define DVFEL_IOC_REG_BUFS2	_IOW(DVFEL_IOC_MAGIC, 8, struct dvfel_reg_bufs2)
 
 #endif

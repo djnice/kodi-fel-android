@@ -37,5 +37,14 @@ case "$1" in
        export KODI_ANDROID_STORE_PASSWORD=$(cat $HOME/.android/kodi-fel.pass)
        export KODI_ANDROID_KEY_ALIAS=kodifel
        export KODI_ANDROID_KEY_PASSWORD=$KODI_ANDROID_STORE_PASSWORD
-       make apk >/tmp/kapk-rel.log 2>&1; echo "apk exit $?"; ls -la $K/kodiapp-armeabi-v7a-release.apk ;;
+       # the incremental packaging of gradle fails every other run
+       rm -rf $B/tools/android/packaging/xbmc/build/intermediates/incremental/packageRelease \
+              $B/tools/android/packaging/xbmc/build/outputs
+       make apk >/tmp/kapk-rel.log 2>&1; r=$?
+       for try in 1 2 3; do [ $r = 0 ] && break
+         # intermittent PackageAndroidArtifact failure: clean the packaging state, retry
+         rm -rf $B/tools/android/packaging/xbmc/build/intermediates/incremental $B/tools/android/packaging/xbmc/build/outputs
+         make apk >/tmp/kapk-rel.log 2>&1; r=$?
+       done
+       echo "apk exit $r"; ls -la $K/kodiapp-armeabi-v7a-release.apk ;;
 esac

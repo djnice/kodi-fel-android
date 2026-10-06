@@ -103,7 +103,7 @@ private:
     int buf{-1};             // hardware decoded: EL pool buffer
     std::shared_ptr<felgpu_meta> meta;
   };
-  static constexpr int EL_POOL = 8;
+  static constexpr int EL_POOL = 12;
 
   void ElThread();
   void HwElThread();
@@ -137,7 +137,11 @@ private:
   std::deque<ElPacket> m_elQueue;
   std::map<int64_t, ElFrame> m_elFrames; // by display pts
   std::map<int64_t, uint32_t> m_crcByPts; // RPU CRC of the packets given to the decoder
+  std::map<int64_t, std::shared_ptr<felgpu_meta>> m_metaByPts; // RPU mapping by packet pts
   int64_t m_lastJobPts{INT64_MIN}; // last frame the kernel asked for
+  // frames shown before the first decodable EL picture after a start or seek
+  // (skipped leading pictures) get no EL: no waiting for them
+  int64_t m_noElBefore{INT64_MIN};
   int m_noPairLogged{0};           // since start or the last seek
   int m_noCrcLogged{0};
 
@@ -148,6 +152,13 @@ private:
   std::atomic<uint64_t> m_composed{0};
   std::atomic<uint64_t> m_passthrough{0};
   std::atomic<uint64_t> m_elDecoded{0};
+  std::atomic<uint64_t> m_noElSkipped{0}; // passed through without waiting
+  std::atomic<uint64_t> m_mappedOnly{0};  // without EL, composed with the mapping only
+  // hardware EL decoder: pictures in and out, pts of the last output
+  std::atomic<uint64_t> m_elInputs{0};
+  std::atomic<uint64_t> m_elOutputs{0};
+  std::atomic<int64_t> m_elLastOut{0};
+  std::atomic<uint64_t> m_elOverflow{0}; // outputs dropped with the pool full
   double m_gpuMsSum{0};
   std::vector<float> m_gpuMs; // per composed frame, GPU thread until Stop
 };

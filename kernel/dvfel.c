@@ -103,6 +103,15 @@ module_param(debug, int, 0644);
  */
 static int test422;
 module_param(test422, int, 0644);
+/*
+ * lin_out (experiment): the display gets linear 10-bit 4:4:4 frames (the
+ * (A)/compositor layout) instead of (B) AFBC; taken at buffer allocation.
+ * lin_endian: the canvas endian of those frames.
+ */
+static int lin_out;
+module_param(lin_out, int, 0644);
+static int lin_endian;
+module_param(lin_endian, int, 0644);
 MODULE_PARM_DESC(test422, "debug: static 12-bit 4:2:2 linear test frame in mode 1 (1: Y high, 2: Y low)");
 
 static int el_wait_ms = 20;
@@ -219,6 +228,9 @@ struct dvfel_slot {
 	struct codec_mm_s *body_mm, *head_mm;
 	bool body_tied;		/* body released by the header's release */
 	ulong body_phys, head_phys, table_phys, table_handle;
+	/* lin_out: the linear frame shown instead of the AFBC one */
+	struct codec_mm_s *lin_mm;
+	ulong lin_phys;
 	/* early release: orig points to snap, the upstream frame is back */
 	bool detached;
 	struct vframe_s snap;
@@ -297,8 +309,18 @@ struct dvfel_dev {
 	bool kick_a, kick_b;
 	bool vc_upstream;	/* upstream is a video composer: poll it */
 	bool early;		/* early release for the current upstream */
+	/*
+	 * early release keeps the newest upstream frame until the next one: a
+	 * video composer counts a buffer the display sends again (repeat, e.g.
+	 * paused or seeking) on the frame its receiver still holds and releases
+	 * the repeats with it; a frame already given back would leak them, and
+	 * the decoder waits for their release fences (1 s each) until it fails
+	 */
+	struct vframe_s *up_held;
 	int dump_left;		/* debug & 4: input frames still to log */
 	u32 in_seq;		/* frames taken since the upstream (re)started */
+	u32 get_vsync;		/* vc_pace: vsync of the last take, takes in it */
+	int gets_this_vsync;
 	bool vc_on;		/* VC_MAP_ID routes video_composer.0 through dvfel */
 	struct work_struct vc_work;
 	bool new_stream;
@@ -312,6 +334,17 @@ struct dvfel_dev {
 	u32 client_w, client_h;
 	int client_nbufs;
 	struct dvfel_cbuf cin[DVFEL_MAX_BUFS], cout[DVFEL_MAX_BUFS];
+	/*
+	 * DVFEL_IOC_REG_BUFS2: the compositor's display buffers, one per slot
+	 * (client_lin); after the compositor is gone they stay referenced
+	 * (zombie) until nothing can show them (dvfel_free_work)
+	 */
+	bool client_lin;
+	struct dvfel_cbuf lout[DVFEL_MAX_OUT];
+	struct dvfel_cbuf zombie[DVFEL_MAX_OUT * 2];
+	int nzombies;
+	bool bufs_client;	/* the slots are bound to lout[] */
+	u32 lout_gen, bound_gen;	/* registrations; the one the slots are bound to */
 	/* hardware decoded EL: receiver of the EL decoder, client EL buffers */
 	struct vframe_receiver_s el_recv;
 	bool el_prov;
@@ -327,6 +360,7 @@ struct dvfel_dev {
 	/* dvfel owned buffers, allocated on the first processable frame */
 	struct mutex buf_lock;
 	bool bufs_ok;
+	bool bufs_lin;		/* slots hold linear frames (lin_out) */
 	ulong lin_phys;
 	/* a_fbc_sink: AFBC output of (A), never read */
 	struct codec_mm_s *sink_body_mm, *sink_head_mm;
@@ -364,7 +398,8 @@ static struct dvfel_dev *gdev;
 /* the video keeper holds the frame of this slot */
 static bool slot_kept(struct dvfel_slot *s)
 {
-	return s->head_mm && atomic_read(&s->head_mm->use_cnt) > 1;
+	return (s->head_mm && atomic_read(&s->head_mm->use_cnt) > 1) ||
+	       (s->lin_mm && atomic_read(&s->lin_mm->use_cnt) > 1);
 }
 
 /*
@@ -453,6 +488,10 @@ static void dvfel_free_bufs(struct dvfel_dev *d)
 			codec_mm_release(s->head_mm, DRV_NAME);
 		if (s->body_mm)
 			codec_mm_release(s->body_mm, DRV_NAME);
+		if (s->lin_mm)
+			codec_mm_release(s->lin_mm, DRV_NAME);
+		s->lin_mm = NULL;
+		s->lin_phys = 0;
 		s->body_tied = false;
 		s->head_mm = s->body_mm = NULL;
 		s->table_handle = s->table_phys = 0;
@@ -471,6 +510,7 @@ static void dvfel_free_bufs(struct dvfel_dev *d)
 	d->sink_head_mm = d->sink_body_mm = NULL;
 	d->sink_table_handle = d->sink_table = d->sink_head = d->sink_body = 0;
 	d->bufs_ok = false;
+	d->bufs_client = false;
 }
 
 static struct codec_mm_s *alloc_mm(u32 size, ulong *phys);
@@ -521,9 +561,23 @@ static int dvfel_alloc_bufs(struct dvfel_dev *d, u32 w, u32 h)
 	if (!d->lin_phys)
 		goto fail;
 
+	d->bufs_client = d->client_lin;
+	d->bound_gen = d->lout_gen;
+	d->bufs_lin = d->bufs_client || lin_out;
 	for (i = 0; i < d->nslots; i++) {
 		struct dvfel_slot *s = &d->slots[i];
 
+		if (d->bufs_client) {
+			s->lin_mm = NULL;
+			s->lin_phys = d->lout[i].phys;
+			continue;
+		}
+		if (d->bufs_lin) {
+			s->lin_mm = alloc_mm(LIN_SIZE(w, h), &s->lin_phys);
+			if (!s->lin_mm)
+				goto fail;
+			continue;
+		}
 		if (alloc_fbc(w, h, &s->body_mm, &s->body_phys, &s->head_mm, &s->head_phys,
 			      &s->table_handle, &s->table_phys))
 			goto fail;
@@ -561,6 +615,8 @@ static bool dvfel_idle_locked(struct dvfel_dev *d)
 	return true;
 }
 
+static void zombies_release(struct dvfel_dev *d);
+
 static void dvfel_free_work(struct work_struct *work)
 {
 	struct dvfel_dev *d = container_of(to_delayed_work(work),
@@ -578,6 +634,7 @@ static void dvfel_free_work(struct work_struct *work)
 		dvfel_free_bufs(d);
 		pr_info(DRV_NAME ": buffers released\n");
 	}
+	zombies_release(d);
 	mutex_unlock(&d->buf_lock);
 }
 
@@ -716,7 +773,41 @@ static bool frame_supported(struct vframe_s *vf)
  * firmware hangs (ISR timeouts until reboot) when operations follow each
  * other too closely.
  */
+/*
+ * el_defer: the EL import (decoded ahead, has slack) yields the VICP to the
+ * display path (A, B): it starts only while no A/B operation is queued or
+ * running, waiting up to el_defer_ms.
+ */
+static int el_defer;
+module_param(el_defer, int, 0644);
+MODULE_PARM_DESC(el_defer, "EL import waits for idle VICP (A/B first)");
+static int el_defer_ms = 30;
+module_param(el_defer_ms, int, 0644);
+static atomic_t vicp_display_ops = ATOMIC_INIT(0);
+static int vicp_run_op(struct vicp_ctx *c);
+static DECLARE_WAIT_QUEUE_HEAD(vicp_idle_wq);
+static u64 el_deferred, el_defer_timeouts;
+
 static int vicp_run(struct vicp_ctx *c)
+{
+	bool display = gdev && c != &gdev->ctx_el;
+	int ret;
+
+	if (display) {
+		atomic_inc(&vicp_display_ops);
+	} else if (el_defer && atomic_read(&vicp_display_ops)) {
+		el_deferred++;
+		if (!wait_event_timeout(vicp_idle_wq, !atomic_read(&vicp_display_ops),
+					msecs_to_jiffies(el_defer_ms)))
+			el_defer_timeouts++;
+	}
+	ret = vicp_run_op(c);
+	if (display && atomic_dec_and_test(&vicp_display_ops))
+		wake_up(&vicp_idle_wq);
+	return ret;
+}
+
+static int vicp_run_op(struct vicp_ctx *c)
 {
 	int ret;
 
@@ -982,8 +1073,24 @@ static void *meta_copy(u8 **dst, const void *src, size_t size)
  * driver reads at display time in the slot, then give @vf back. The copy
  * stands in for the original from here on (orig of the slot/job).
  */
-static void detach_orig(struct dvfel_slot *s, struct vframe_s *vf)
+/* gives the held upstream frame back (process context, not under d->lock) */
+static void up_release_held(struct dvfel_dev *d)
 {
+	struct vframe_s *vf;
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->lock, flags);
+	vf = d->up_held;
+	d->up_held = NULL;
+	spin_unlock_irqrestore(&d->lock, flags);
+	if (vf)
+		vf_put(vf, DRV_NAME);
+}
+
+static void detach_orig(struct dvfel_dev *d, struct dvfel_slot *s, struct vframe_s *vf)
+{
+	struct vframe_s *prev;
+	unsigned long flags;
 	const struct vframe_src_fmt_s *in = &vf->src_fmt;
 	struct vframe_src_fmt_s *f = &s->snap.src_fmt;
 	size_t sei = in->sei_ptr ? in->sei_size : 0;
@@ -1027,7 +1134,12 @@ static void detach_orig(struct dvfel_slot *s, struct vframe_s *vf)
 	 * runs out of buffers.
 	 */
 	vf->rendered = true;
-	vf_put(vf, DRV_NAME);
+	spin_lock_irqsave(&d->lock, flags);
+	prev = d->up_held;
+	d->up_held = vf;
+	spin_unlock_irqrestore(&d->lock, flags);
+	if (prev)
+		vf_put(prev, DRV_NAME);
 }
 
 /* process context; the map may change only while nothing plays through it */
@@ -1114,12 +1226,34 @@ static void capture_frame(struct dvfel_dev *d, struct vframe_s *vf, ulong src,
 /* stage A: decoder frames -> (A) -> job or direct round trip         */
 /* ------------------------------------------------------------------ */
 
+/* the slots use the current compositor's display buffers, if it gave any (buf_lock) */
+static bool bufs_bound_ok(struct dvfel_dev *d)
+{
+	return d->bufs_client == d->client_lin && (!d->client_lin || d->bound_gen == d->lout_gen);
+}
+
+static void cbuf_put(struct dvfel_cbuf *b);
+
+/* display buffers of former registrations, once no slot is bound to them (buf_lock) */
+static void zombies_release(struct dvfel_dev *d)
+{
+	int i;
+
+	if (!d->nzombies || (d->bufs_ok && d->bufs_client && d->bound_gen != d->lout_gen))
+		return;
+	for (i = 0; i < d->nzombies; i++)
+		cbuf_put(&d->zombie[i]);
+	pr_info(DRV_NAME ": %d former compositor display buffers released\n", d->nzombies);
+	d->nzombies = 0;
+}
+
 static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
 {
 	bool ok;
 
 	mutex_lock(&d->buf_lock);
-	if (d->bufs_ok && (d->buf_w != w || d->buf_h != h)) {
+	/* another size, or the compositor's display buffers came or went */
+	if (d->bufs_ok && (d->buf_w != w || d->buf_h != h || !bufs_bound_ok(d))) {
 		unsigned long flags;
 		bool idle;
 
@@ -1129,7 +1263,9 @@ static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
 		if (idle)
 			dvfel_free_bufs(d);
 	}
-	ok = d->bufs_ok ? (d->buf_w == w && d->buf_h == h) : !dvfel_alloc_bufs(d, w, h);
+	ok = d->bufs_ok ? (d->buf_w == w && d->buf_h == h && bufs_bound_ok(d))
+			: !dvfel_alloc_bufs(d, w, h);
+	zombies_release(d);
 	mutex_unlock(&d->buf_lock);
 	return ok;
 }
@@ -1196,12 +1332,87 @@ static void test422_frame(struct dvfel_dev *d, struct dvfel_slot *s,
 	o->fgs_valid = false;
 }
 
+/* CPU copy of a linear frame (rare: a job the compositor did not compose) */
+static int lin_copy(ulong dst, ulong src, u32 w, u32 h)
+{
+	size_t size = (size_t)LIN_STRIDE(w) * h;
+	void *vd = codec_mm_phys_to_virt(dst), *vs = codec_mm_phys_to_virt(src);
+
+	if (!vd || !vs)
+		return -EFAULT;
+	codec_mm_dma_flush(vs, size, DMA_FROM_DEVICE);
+	memcpy(vd, vs, size);
+	codec_mm_dma_flush(vd, size, DMA_TO_DEVICE);
+	return 0;
+}
+
+/* lin_out: the slot's linear 10-bit 4:4:4 frame (one 32-bit word per pixel) */
+static void build_lin_out_vf(struct dvfel_slot *s, struct vframe_s *orig, u32 w, u32 h)
+{
+	struct vframe_s *o = &s->out_vf;
+
+	*o = *orig;
+	INIT_LIST_HEAD(&o->list);
+	o->type = VIDTYPE_PROGRESSIVE | VIDTYPE_VIU_FIELD | VIDTYPE_VIU_444 |
+		  VIDTYPE_VIU_SINGLE_PLANE;
+	o->type_backup = o->type;
+	o->type_original = o->type;
+	o->bitdepth = BITDEPTH_Y10 | BITDEPTH_U10 | BITDEPTH_V10;
+	o->flag |= VFRAME_FLAG_VIDEO_LINEAR | VFRAME_FLAG_COMPOSER_DONE;
+	o->compHeadAddr = 0;
+	o->compBodyAddr = 0;
+	o->compWidth = 0;
+	o->compHeight = 0;
+	o->width = w;
+	o->height = h;
+	o->canvas0Addr = (u32)-1;
+	o->canvas1Addr = (u32)-1;
+	o->plane_num = 1;
+	memset(o->canvas0_config, 0, sizeof(o->canvas0_config));
+	o->canvas0_config[0].phy_addr = s->lin_phys;
+	o->canvas0_config[0].width = LIN_STRIDE(w);
+	o->canvas0_config[0].height = h;
+	o->canvas0_config[0].block_mode = CANVAS_BLKMODE_LINEAR;
+	o->canvas0_config[0].endian = lin_endian;
+	memcpy(o->canvas1_config, o->canvas0_config, sizeof(o->canvas1_config));
+	o->mem_handle = s->lin_mm;
+	o->mem_handle_1 = NULL;
+	o->mem_head_handle = NULL;
+	o->mem_dw_handle = NULL;
+	o->vf_ext = NULL;
+#ifndef DVFEL_KERNEL_54
+	o->uvm_vf = NULL;
+#endif
+	o->early_process_fun = NULL;
+	o->process_fun = NULL;
+	o->private_data = NULL;
+	o->fence = NULL;
+	o->fgs_valid = false;
+}
+
 static bool process_direct(struct dvfel_dev *d, struct dvfel_slot *s,
 			   struct vframe_s *vf, bool capture)
 {
 	u32 w = vf->compWidth, h = vf->compHeight;
 	ktime_t t0, t1, t2;
 	bool ok;
+
+	if (d->bufs_lin) {
+		mutex_lock(&d->buf_lock);
+		t0 = ktime_get();
+		ok = vicp_ok(d, vicp_decompress(&d->ctx_a, vf, s->lin_phys, w, h),
+			     ktime_us_delta(ktime_get(), t0), "A");
+		if (ok) {
+			s64 ua = ktime_us_delta(ktime_get(), t0);
+
+			d->us_a_sum += ua;
+			d->us_a_max = max(d->us_a_max, ua);
+			d->us_cnt++;
+			build_lin_out_vf(s, vf, w, h);
+		}
+		mutex_unlock(&d->buf_lock);
+		return ok;
+	}
 
 	if (test422) {
 		mutex_lock(&d->buf_lock);
@@ -1408,6 +1619,37 @@ static const struct vframe_receiver_op_s dvfel_el_recv_ops = {
 	.event_cb = dvfel_el_event,
 };
 
+/*
+ * vc_pace: a video composer hands out frames by the time of the last vsync,
+ * expecting the display to ask once per vsync (from its vsync interrupt).
+ * Polling it in between takes frames early and two within one vsync (its
+ * vpp_drop_cnt). Take at most one per vsync, two when it has a backlog.
+ */
+int get_vsync_count(unsigned char reset);
+static int vc_pace = 1;
+module_param(vc_pace, int, 0644);
+
+static bool vc_may_get(struct dvfel_dev *d)
+{
+	struct vframe_provider_s *p;
+	struct vframe_states st;
+	u32 now;
+
+	if (!vc_pace || !d->vc_upstream)
+		return true;
+	now = get_vsync_count(0);
+	if (now != d->get_vsync) {
+		d->get_vsync = now;
+		d->gets_this_vsync = 0;
+	}
+	if (!d->gets_this_vsync)
+		return true;
+	if (d->gets_this_vsync >= 2)
+		return false;
+	p = vf_get_provider(DRV_NAME);
+	return p && !vf_get_states(p, &st) && st.buf_avail_num >= 2;
+}
+
 static int dvfel_thread_a(void *data)
 {
 	struct dvfel_dev *d = data;
@@ -1432,6 +1674,8 @@ static int dvfel_thread_a(void *data)
 			int j = -1;
 			u32 gen, w, h;
 
+			if (!vc_may_get(d))
+				break;
 			spin_lock_irqsave(&d->lock, flags);
 			if (!d->prov_reg || d->pend_cnt >= QUEUE_LEN || !pass_free(d)) {
 				spin_unlock_irqrestore(&d->lock, flags);
@@ -1477,6 +1721,7 @@ static int dvfel_thread_a(void *data)
 				break;
 			}
 			d->frames_in++;
+			d->gets_this_vsync++;
 			seq = d->in_seq++;
 			w = vf->compWidth;
 			h = vf->compHeight;
@@ -1569,9 +1814,11 @@ static int dvfel_thread_a(void *data)
 				rpu_ok = rpu_crc_of(vf, &rpu_crc);
 			if (ok && d->early) {
 				/* (A) is done: from here on the slot copy stands in for vf */
-				detach_orig(s, vf);
+				detach_orig(d, s, vf);
 				vf = &s->snap;
-				if (!gpu)
+				if (!gpu && d->bufs_lin)
+					build_lin_out_vf(s, vf, w, h);
+				else if (!gpu)
 					build_out_vf(s, vf, w, h);
 			}
 
@@ -1694,13 +1941,22 @@ static void finish_job(struct dvfel_dev *d, struct dvfel_pend *pe)
 	j->capture = false;
 	mutex_lock(&d->buf_lock);
 	t0 = ktime_get();
-	ok = vicp_ok(d, vicp_compress(&d->ctx_b, src, s, w, h),
-		     ktime_us_delta(ktime_get(), t0), "B");
-	if (ok) {
-		stat_b(d, ktime_us_delta(ktime_get(), t0));
-		build_out_vf(s, orig, w, h);
-		if (capture)
-			capture_frame(d, orig, src, s, w, h);
+	if (d->bufs_client) {
+		/* the compositor wrote the slot's display buffer; else show the BL */
+		ok = composed || !lin_copy(s->lin_phys, src, w, h);
+		if (ok)
+			build_lin_out_vf(s, orig, w, h);
+	} else {
+		/* lin_out without REG_BUFS2: not supported (no AFBC buffers) */
+		ok = !d->bufs_lin &&
+		     vicp_ok(d, vicp_compress(&d->ctx_b, src, s, w, h),
+			     ktime_us_delta(ktime_get(), t0), "B");
+		if (ok) {
+			stat_b(d, ktime_us_delta(ktime_get(), t0));
+			build_out_vf(s, orig, w, h);
+			if (capture)
+				capture_frame(d, orig, src, s, w, h);
+		}
 	}
 	mutex_unlock(&d->buf_lock);
 
@@ -1952,6 +2208,7 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 		cancel_delayed_work_sync(&d->free_work);
 		spin_lock_irqsave(&d->lock, flags);
 		dvfel_reset_locked(d);
+		d->up_held = NULL;
 		d->prov_reg = true;
 		d->vc_upstream = data && !strncmp(data, "video_composer", 14);
 		d->early = early_release > 0 || (early_release < 0 && d->vc_upstream);
@@ -1967,6 +2224,11 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 		dvfel_dbg("upstream UNREG\n");
 		spin_lock_irqsave(&d->lock, flags);
 		d->prov_reg = false;
+		/*
+		 * the provider is gone already (vf_put cannot reach it); the
+		 * composer cleans up what its receiver holds, as for the display
+		 */
+		d->up_held = NULL;
 		dvfel_reset_locked(d);
 		spin_unlock_irqrestore(&d->lock, flags);
 		vf_unreg_provider(&d->prov);
@@ -1978,6 +2240,7 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 		schedule_work(&d->vc_work);
 		break;
 	case VFRAME_EVENT_PROVIDER_LIGHT_UNREG:
+		up_release_held(d);
 		spin_lock_irqsave(&d->lock, flags);
 		dvfel_reset_locked(d);
 		spin_unlock_irqrestore(&d->lock, flags);
@@ -1986,6 +2249,7 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 		wake_up_interruptible(&d->wq_b);
 		break;
 	case VFRAME_EVENT_PROVIDER_RESET:
+		up_release_held(d);
 		spin_lock_irqsave(&d->lock, flags);
 		dvfel_reset_locked(d);
 		spin_unlock_irqrestore(&d->lock, flags);
@@ -2109,19 +2373,51 @@ static void client_unreg(struct dvfel_dev *d)
 		cbuf_put(&d->cel[i]);
 		d->jobs[i].state = JOB_FREE;
 	}
+	if (d->client_lin) {
+		/* the display may still show them: released by dvfel_free_work */
+		mutex_lock(&d->buf_lock);
+		d->client_lin = false;
+		d->lout_gen++;		/* bound slots now point to zombies */
+		for (i = 0; i < DVFEL_MAX_OUT; i++) {
+			if (!d->lout[i].db)
+				continue;
+			if (d->nzombies < ARRAY_SIZE(d->zombie))
+				d->zombie[d->nzombies++] = d->lout[i];
+			else
+				cbuf_put(&d->lout[i]);
+			memset(&d->lout[i], 0, sizeof(d->lout[i]));
+		}
+		mutex_unlock(&d->buf_lock);
+		schedule_delayed_work(&d->free_work, msecs_to_jiffies(3000));
+	}
 	d->client_nbufs = 0;
 	d->client_el_w = d->client_el_h = 0;
 	gpu_boost_set(false);
 }
 
-static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
+/* DVFEL_IOC_REG_BUFS (out_count 0) and DVFEL_IOC_REG_BUFS2 */
+static long reg_bufs(struct dvfel_dev *d, struct file *f, struct dvfel_reg_bufs2 *r2);
+
+static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg, bool v2)
 {
-	struct dvfel_reg_bufs r;
+	struct dvfel_reg_bufs2 r2;
+
+	memset(&r2, 0, sizeof(r2));
+	if (copy_from_user(v2 ? (void *)&r2 : (void *)&r2.base, arg,
+			   v2 ? sizeof(r2) : sizeof(r2.base)))
+		return -EFAULT;
+	if (v2 && (r2.out_count < d->nslots || r2.out_count > DVFEL_MAX_OUT))
+		return -EINVAL;
+	return reg_bufs(d, f, &r2);	/* v1: out_count 0 */
+}
+
+static long reg_bufs(struct dvfel_dev *d, struct file *f, struct dvfel_reg_bufs2 *r2)
+{
+	struct dvfel_reg_bufs r = r2->base;
+	bool lin = r2->out_count > 0;
 	size_t size;
 	int i, ret;
 
-	if (copy_from_user(&r, arg, sizeof(r)))
-		return -EFAULT;
 	if (!r.count || r.count > DVFEL_MAX_BUFS || !r.width || !r.height ||
 	    r.width > MAX_W || r.height > MAX_H || !wmif_bg_width(r.width))
 		return -EINVAL;
@@ -2139,7 +2435,7 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 		client_unreg(d);
 	for (i = 0; i < r.count; i++) {
 		ret = cbuf_get(d, &d->cin[i], r.in_fd[i], size);
-		if (!ret)
+		if (!ret && !lin)
 			ret = cbuf_get(d, &d->cout[i], r.out_fd[i], size);
 		if (!ret && r.el_width)
 			ret = cbuf_get(d, &d->cel[i], r.el_fd[i], LIN_SIZE(r.el_width, r.el_height));
@@ -2150,6 +2446,24 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 			pr_err(DRV_NAME ": buffer %d rejected (need %zu contiguous bytes)\n",
 			       i, size);
 			return ret;
+		}
+	}
+	if (lin) {
+		/* the display buffers: one per slot */
+		mutex_lock(&d->buf_lock);
+		d->client_lin = true;
+		d->lout_gen++;
+		mutex_unlock(&d->buf_lock);
+		for (i = 0; i < d->nslots; i++) {
+			ret = cbuf_get(d, &d->lout[i], r2->lin_fd[i], size);
+			if (ret) {
+				d->client_nbufs = r.count;
+				client_unreg(d);
+				mutex_unlock(&d->client_lock);
+				pr_err(DRV_NAME ": display buffer %d rejected (need %zu contiguous bytes)\n",
+				       i, size);
+				return ret;
+			}
 		}
 	}
 	d->client = f;
@@ -2164,8 +2478,8 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 	vc_path_apply(d);
 	gpu_boost_set(true);
 	mutex_unlock(&d->client_lock);
-	pr_info(DRV_NAME ": compositor registered %u buffer pairs %ux%u, EL %ux%u\n",
-		r.count, r.width, r.height, r.el_width, r.el_height);
+	pr_info(DRV_NAME ": compositor registered %u buffer pairs %ux%u, EL %ux%u, display buffers %u\n",
+		r.count, r.width, r.height, r.el_width, r.el_height, lin ? d->nslots : 0);
 	return 0;
 }
 
@@ -2223,6 +2537,8 @@ static long ioc_wait_job(struct dvfel_dev *d, struct file *f, void __user *arg, 
 	u.el_au = d->jobs[i].el_au;
 	u2.rpu_crc = d->jobs[i].rpu_crc;
 	u2.seq = d->jobs[i].seq;
+	if (d->jobs[i].slot)
+		u2.out = d->jobs[i].slot - d->slots;
 	spin_unlock_irqrestore(&d->lock, flags);
 	if (!v2)
 		return copy_to_user(arg, &u, sizeof(u)) ? -EFAULT : 0;
@@ -2430,7 +2746,9 @@ static long dvfel_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case DVFEL_IOC_REG_BUFS:
-		return ioc_reg_bufs(d, f, p);
+		return ioc_reg_bufs(d, f, p, false);
+	case DVFEL_IOC_REG_BUFS2:
+		return ioc_reg_bufs(d, f, p, true);
 	case DVFEL_IOC_WAIT_JOB:
 		return ioc_wait_job(d, f, p, false);
 	case DVFEL_IOC_WAIT_JOB2:
@@ -2511,6 +2829,24 @@ static int stats_show(struct seq_file *m, void *v)
 		   d->us_el_wait_max);
 	seq_printf(m, "queued %d, pending %d\n", d->outq_cnt, d->pend_cnt);
 	{
+		/* F free, B busy, O out (t: taken by the display), H held; jobs by state */
+		static const char st[] = "FBOH";
+		char sl[MAX_SLOTS * 2 + 1], jb[DVFEL_MAX_BUFS + 1];
+		int i, n = 0;
+
+		for (i = 0; i < d->nslots && i < MAX_SLOTS; i++) {
+			sl[n++] = st[d->slots[i].state];
+			if (d->slots[i].state == SLOT_OUT && d->slots[i].taken)
+				sl[n++] = 't';
+		}
+		sl[n] = 0;
+		for (i = 0; i < DVFEL_MAX_BUFS; i++)
+			jb[i] = '0' + d->jobs[i].state;
+		jb[DVFEL_MAX_BUFS] = 0;
+		seq_printf(m, "slots %s, jobs %s, gen %u, shown_new %d\n", sl, jb, d->gen, d->shown_new);
+	}
+	seq_printf(m, "EL import deferred %llu (waited out %llu)\n", el_deferred, el_defer_timeouts);
+	{
 		static const char * const recv[] = { DRV_NAME, EL_RECV_NAME };
 		int i;
 
@@ -2539,10 +2875,64 @@ static ssize_t stats_reset_write(struct file *f, const char __user *buf,
 	d->us_a_sum = d->us_b_sum = d->us_a_max = d->us_b_max = 0;
 	d->us_gpu_sum = d->us_gpu_max = 0;
 	d->el_in = d->el_used = d->el_dropped = d->el_missing = 0;
+	el_deferred = el_defer_timeouts = 0;
 	d->us_el_sum = d->us_el_max = d->us_el_wait_max = d->us_el_cnt = 0;
 	d->us_cnt = d->us_b_cnt = d->us_gpu_cnt = 0;
 	return len;
 }
+
+/* lin_out test: "x y" selects a pixel, reading shows it in the shown slots */
+static u32 pix_x, pix_y;
+
+static int pixel_show(struct seq_file *m, void *v)
+{
+	struct dvfel_dev *d = m->private;
+	int i;
+
+	seq_printf(m, "pixel %u %u (lin %d, %ux%u)\n", pix_x, pix_y, d->bufs_lin, d->buf_w, d->buf_h);
+	if (!d->bufs_lin || pix_x >= d->buf_w || pix_y >= d->buf_h)
+		return 0;
+	for (i = 0; i < d->nslots; i++) {
+		struct dvfel_slot *s = &d->slots[i];
+		size_t off = (size_t)pix_y * LIN_STRIDE(d->buf_w) + pix_x * 4;
+		u8 *va = s->lin_phys ? codec_mm_phys_to_virt(s->lin_phys) : NULL;
+		u32 px;
+
+		if (!va || s->state != SLOT_OUT)
+			continue;
+		codec_mm_dma_flush(va + off, 4, DMA_FROM_DEVICE);
+		px = get_unaligned_le32(va + off);
+		seq_printf(m, "slot %d%s: %08x Y %u Cb %u Cr %u\n", i, s->taken ? " (shown)" : "",
+			   px, (px >> 20) & 0x3ff, (px >> 10) & 0x3ff, px & 0x3ff);
+	}
+	return 0;
+}
+
+static int pixel_open(struct inode *inode, struct file *f)
+{
+	return single_open(f, pixel_show, inode->i_private);
+}
+
+static ssize_t pixel_write(struct file *f, const char __user *buf, size_t len, loff_t *ppos)
+{
+	char tmp[32];
+
+	if (len >= sizeof(tmp) || copy_from_user(tmp, buf, len))
+		return -EINVAL;
+	tmp[len] = 0;
+	if (sscanf(tmp, "%u %u", &pix_x, &pix_y) != 2)
+		return -EINVAL;
+	return len;
+}
+
+static const struct file_operations pixel_fops = {
+	.owner = THIS_MODULE,
+	.open = pixel_open,
+	.read = seq_read,
+	.write = pixel_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 static const struct file_operations stats_reset_fops = {
 	.open = simple_open,
@@ -2722,6 +3112,7 @@ static int __init dvfel_init(void)
 	debugfs_create_file("stats_reset", 0200, d->dbg, d, &stats_reset_fops);
 	debugfs_create_file("capture", 0600, d->dbg, d, &capture_fops);
 	debugfs_create_file("selftest", 0200, d->dbg, d, &selftest_fops);
+	debugfs_create_file("pixel", 0600, d->dbg, d, &pixel_fops);
 
 	mutex_lock(&d->client_lock);
 	vc_path_apply(d);
@@ -2771,6 +3162,10 @@ static void __exit dvfel_exit(void)
 	cancel_delayed_work_sync(&d->free_work);
 	mutex_lock(&d->buf_lock);
 	dvfel_free_bufs(d);
+	/* display buffers of former compositors still waiting for release */
+	zombies_release(d);
+	for (i = 0; i < DVFEL_MAX_OUT; i++)
+		cbuf_put(&d->lout[i]);
 	mutex_unlock(&d->buf_lock);
 	/* body_release_cb() must not outlive the module */
 	for (i = 0; i < MAX_SLOTS; i++)

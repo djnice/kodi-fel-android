@@ -1,0 +1,106 @@
+diff --git a/xbmc/platform/android/activity/XBMCApp.cpp b/xbmc/platform/android/activity/XBMCApp.cpp
+index b1f265ef68..d8a99b0cbb 100644
+--- a/xbmc/platform/android/activity/XBMCApp.cpp
++++ b/xbmc/platform/android/activity/XBMCApp.cpp
+@@ -1579,6 +1579,25 @@ int64_t CXBMCApp::GetNextFrameTime() const
+     return m_frameTimeNanos;
+ }
+ 
++float CXBMCApp::GetMeasuredRefreshRate() const
++{
++  const int64_t period = m_vsyncPeriodNanos;
++  return period > 0 ? 1e9f / static_cast<float>(period) : 0.0f;
++}
++
++float CXBMCApp::GetDisplayRefreshRate()
++{
++  CJNIWindow window = getWindow();
++  if (!window)
++    return 0.0f;
++  CJNIView view = window.getDecorView();
++  CJNIDisplay display = view ? view.getDisplay() : CJNIDisplay();
++  if (!display)
++    return 0.0f;
++  CJNIDisplayMode mode = display.getMode();
++  return mode ? mode.getRefreshRate() : 0.0f;
++}
++
+ float CXBMCApp::GetFrameLatencyMs() const
+ {
+   return (CurrentHostCounter() - m_frameTimeNanos) * 0.000001;
+diff --git a/xbmc/platform/android/activity/XBMCApp.h b/xbmc/platform/android/activity/XBMCApp.h
+index 24ab384894..60a8afe11a 100644
+--- a/xbmc/platform/android/activity/XBMCApp.h
++++ b/xbmc/platform/android/activity/XBMCApp.h
+@@ -204,6 +204,10 @@ public:
+   bool WaitVSync(unsigned int milliSeconds);
+   int64_t GetNextFrameTime() const;
+   float GetFrameLatencyMs() const;
++  // the display's actual refresh rate: measured from the Choreographer callbacks (0 if not
++  // yet known), and the mode the display reports (Java, not from the Choreographer thread)
++  float GetMeasuredRefreshRate() const;
++  float GetDisplayRefreshRate();
+ 
+ protected:
+   // limit who can access Volume
+diff --git a/xbmc/windowing/android/VideoSyncAndroid.cpp b/xbmc/windowing/android/VideoSyncAndroid.cpp
+index f0e1d90cb2..361943b24f 100644
+--- a/xbmc/windowing/android/VideoSyncAndroid.cpp
++++ b/xbmc/windowing/android/VideoSyncAndroid.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include "platform/android/activity/XBMCApp.h"
+ 
++#include <cmath>
++
+ bool CVideoSyncAndroid::Setup()
+ {
+   CLog::Log(LOGDEBUG, "CVideoSyncAndroid::{} setting up", __FUNCTION__);
+@@ -49,6 +51,22 @@ void CVideoSyncAndroid::Cleanup()
+ float CVideoSyncAndroid::GetFps()
+ {
+   m_fps = CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS();
++  // the output mode may be switched outside Kodi (e.g. the auto frame rate of the Dune HD
++  // firmware): Kodi's mode is then wrong, and counting vblanks with it makes the clock
++  // jump (2 and 3 "vblanks" per 23.976 Hz callback at 59.94). Use the display's actual
++  // mode; the Choreographer rate decides if the two disagree.
++  const float display = CXBMCApp::Get().GetDisplayRefreshRate();
++  const float measured = CXBMCApp::Get().GetMeasuredRefreshRate();
++  float actual = display;
++  if (measured > 1.0f && (actual <= 1.0f || std::abs(actual - measured) > measured * 0.05f))
++    actual = measured;
++  if (actual > 1.0f && std::abs(actual - m_fps) > 0.01f)
++  {
++    CLog::Log(LOGINFO,
++              "CVideoSyncAndroid: the display runs at {:.3f} Hz (Kodi: {:.3f}, measured {:.3f})",
++              actual, m_fps, measured);
++    m_fps = actual;
++  }
+   CLog::Log(LOGDEBUG, "CVideoSyncAndroid::{} Detected refreshrate: {:f} hertz", __FUNCTION__,
+             m_fps);
+   return m_fps;
+@@ -73,4 +91,14 @@ void CVideoSyncAndroid::FrameCallback(int64_t frameTimeNanos)
+ 
+   //update the vblank timestamp, update the clock and send a signal that we got a vblank
+   m_refClock->UpdateClock(NrVBlanks, frameTimeNanos);
++
++  // the output mode changed under us: restart the clock with the new rate (GetFps)
++  const float measured = CXBMCApp::Get().GetMeasuredRefreshRate();
++  if (measured > 1.0f && std::abs(measured - m_fps) > m_fps * 0.05f && !m_restart)
++  {
++    m_restart = true;
++    CLog::Log(LOGINFO, "CVideoSyncAndroid: refresh rate changed to ~{:.3f} Hz (was {:.3f})",
++              measured, m_fps);
++    m_abortEvent.Set();
++  }
+ }
+diff --git a/xbmc/windowing/android/VideoSyncAndroid.h b/xbmc/windowing/android/VideoSyncAndroid.h
+index c4722af7d3..5c5b445f67 100644
+--- a/xbmc/windowing/android/VideoSyncAndroid.h
++++ b/xbmc/windowing/android/VideoSyncAndroid.h
+@@ -32,4 +32,5 @@ private:
+   int64_t m_LastVBlankTime =
+       0; //timestamp of the last vblank, used for calculating how many vblanks happened
+   CEvent m_abortEvent;
++  bool m_restart = false; // a refresh rate change is being handled
+ };

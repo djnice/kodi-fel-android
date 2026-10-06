@@ -150,7 +150,31 @@ int main(int argc, char** argv)
   while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
     stream.insert(stream.end(), buf, buf + n);
   fclose(f);
-  auto aus = SplitAus(stream);
+  // a Kodi EL dump (*.bin, /sdcard/dvfel_eldump): [u32 size][i64 pts][data] records,
+  // fed with their pts unless SEQPTS=1
+  std::vector<std::vector<uint8_t>> aus;
+  std::vector<int64_t> ptsOf;
+  const size_t len = strlen(argv[1]);
+  if (len > 4 && !strcmp(argv[1] + len - 4, ".bin"))
+  {
+    for (size_t off = 0; off + 12 <= stream.size();)
+    {
+      uint32_t sz;
+      int64_t t;
+      memcpy(&sz, &stream[off], 4);
+      memcpy(&t, &stream[off + 4], 8);
+      off += 12;
+      if (off + sz > stream.size())
+        break;
+      aus.emplace_back(stream.begin() + off, stream.begin() + off + sz);
+      ptsOf.push_back(t);
+      off += sz;
+    }
+    if (getenv("SEQPTS") && atoi(getenv("SEQPTS")))
+      ptsOf.clear();
+  }
+  else
+    aus = SplitAus(stream);
   printf("%zu access units\n", aus.size());
 
   // binder callbacks (not in the public NDK headers)
@@ -167,6 +191,7 @@ int main(int argc, char** argv)
   // IMPORT=1: DVFEL_IOC_EL_IMPORT of every picture; DUMP=n: write output n
   const bool doImport = getenv("IMPORT") && atoi(getenv("IMPORT"));
   const int dumpAt = getenv("DUMP") ? atoi(getenv("DUMP")) : -1;
+  const int W = getenv("W") ? atoi(getenv("W")) : 1920, H = getenv("H") ? atoi(getenv("H")) : 1080;
   const size_t linSize = DVFEL_BUF_SIZE(1920, 1080);
   const int linFd = doImport ? IonAllocCma(linSize) : -1;
   if (doImport)
@@ -176,7 +201,7 @@ int main(int argc, char** argv)
 
   AImageReader* reader = nullptr;
   media_status_t st =
-      AImageReader_newWithUsage(1920, 1080, AIMAGE_FORMAT_PRIVATE, usage, maxImages, &reader);
+      AImageReader_newWithUsage(W, H, AIMAGE_FORMAT_PRIVATE, usage, maxImages, &reader);
   if (st != AMEDIA_OK)
   {
     printf("AImageReader_newWithUsage: %d\n", st);
@@ -193,8 +218,8 @@ int main(int argc, char** argv)
   }
   AMediaFormat* fmt = AMediaFormat_new();
   AMediaFormat_setString(fmt, AMEDIAFORMAT_KEY_MIME, "video/hevc");
-  AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, 1920);
-  AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, 1080);
+  AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, W);
+  AMediaFormat_setInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, H);
   st = AMediaCodec_configure(codec, fmt, win, nullptr, 0);
   printf("configure: %d\n", st);
   st = AMediaCodec_start(codec);
@@ -205,9 +230,13 @@ int main(int argc, char** argv)
   bool eosSent = false;
   const int64_t t0 = NowUs();
   int64_t lastProgress = t0;
+  // FPS=n: feed in real time, LEAD pictures ahead of the clock (like Kodi's pacing)
+  const double fps = getenv("FPS") ? atof(getenv("FPS")) : 0;
+  const int lead = getenv("LEAD") ? atoi(getenv("LEAD")) : 8;
   while (out < maxFrames && NowUs() - lastProgress < 3000000)
   {
-    if (!eosSent)
+    const bool due = fps <= 0 || (int)in < lead || NowUs() - t0 >= (int64_t)((in - lead) * 1e6 / fps);
+    if (!eosSent && due)
     {
       ssize_t idx = AMediaCodec_dequeueInputBuffer(codec, 2000);
       if (idx >= 0)
@@ -217,7 +246,7 @@ int main(int argc, char** argv)
         if (in < aus.size() && (int)in < maxFrames + 16 && aus[in].size() <= cap)
         {
           memcpy(p, aus[in].data(), aus[in].size());
-          AMediaCodec_queueInputBuffer(codec, idx, 0, aus[in].size(), in * 41708, 0);
+          AMediaCodec_queueInputBuffer(codec, idx, 0, aus[in].size(), in < ptsOf.size() ? ptsOf[in] : (int64_t)in * 41708, 0);
           in++;
         }
         else

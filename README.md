@@ -15,7 +15,8 @@ Kodi demux ─ BitstreamConverter: RPU → profile 8.1 (no-op mapping), EL NAL u
            → DVFEL_IOC_EL_IMPORT: VICP → linear 4:4:4 ─────────────┤
                                      GPU (felgpu): Lanczos-3 EL upscale, polynomial/MMR prediction,
                                      NLQ, 12-bit composition, dither ←──┘ (+ original RPU)
-  → dvfel: VICP B, linear → AFBC → video_render.0 → amvideo → Dolby Vision core (profile 8.1)
+  → GPU writes the dvfel slot's display buffer (linear 10-bit 4:4:4)
+  → video_render.0 → amvideo (VD1 reads it directly) → Dolby Vision core (profile 8.1)
 ```
 
 Pairing BL and EL frames: the kernel reports the `rpu_data_crc32` of each displayed frame's RPU; the
@@ -52,8 +53,8 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 
 | Path | Content |
 |---|---|
-| `kernel/` | `dvfel` kernel module (GPL-2.0+): vfm node between video_composer and video_render, VICP A/B, EL import, GPU job interface (`dvfel_uapi.h`). Builds for the Dune 5.4 GKI kernel and the CoreELEC 5.15 kernels. |
-| `kodi/patches/` | Patches for upstream Kodi `22.0rc1-Piers` (`28ea2eac1e`): 9900 FEL composition + module installer, 9901 vsync period from Choreographer + startup crash fixes. |
+| `kernel/` | `dvfel` kernel module (GPL-2.0+): vfm node between video_composer and video_render, VICP A, EL import, GPU job interface with direct display buffers (`dvfel_uapi.h`, `DVFEL_IOC_REG_BUFS2`; the older AFBC output path with VICP B is still there for older compositors). Builds for the Dune 5.4 GKI kernel. |
+| `kodi/patches/` | Patches for upstream Kodi `22.0rc1-Piers` (`28ea2eac1e`), in this order: 9900 FEL composition + module installer, 9901 vsync period from Choreographer + startup crash fixes, 9902 video reference clock at the display's actual refresh rate. |
 | `kodi/src/` | The main new sources from 9900 for reading: `AndroidDvFel.*`, `felgpu.*` (GPU composer). |
 | `tools/` | `kbuild.sh` (module build with the firmware's CRCs), `modver.py` (CRC database/symvers from firmware modules), `fwcheck.sh` (does a build fit a player? trial load over adb), `elprobe.cpp` (EL import probe), `sync.sh` (build script used for the releases). |
 | `docs/NOTES.md` | Technical notes and pitfalls of this firmware. |
@@ -61,17 +62,35 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 ## Building (outline)
 
 - Kodi: upstream `22.0rc1-Piers` + `kodi/patches/*`, Android armeabi-v7a, NDK r28c, API 24, depends with
-  `--disable-debug`; cmake `-DAPP_PACKAGE=org.xbmc.kodi.fel`. The module builds go to `system/dvfel/` with
-  `variants.txt`.
+  `--disable-debug`; cmake `-DAPP_PACKAGE=org.xbmc.kodi.fel`. The module build goes to
+  `system/dvfel/dvfel.ko`.
 - Module: clang 11.0.1 (`LLVM=1`, as the firmware kernel), a kernel tree configured like the firmware, the
   Amlogic media headers matching the firmware's structures, and the firmware's symbol CRCs
   (`modver.py db/symvers` from its vendor modules and `aml_media.ko`) – see `tools/kbuild.sh`.
 
 ## Status / known limits
 
-- Proof of concept: one firmware tested. 4K 50/60p FEL is too heavy (GPU and VICP time).
+- Proof of concept: one firmware tested. 4K 50/60p FEL is too heavy (GPU time).
 - The Dune auto frame rate does not switch back after stop until you return to the Dune home screen.
-- After a seek, 1–2 frames may be shown without the EL.
+- After a seek, 1–2 frames may be shown with the RPU mapping only (no EL residual).
+- Kodi still drops a frame now and then (0–3 a minute measured), like without FEL: its clock and the
+  display drift apart.
+
+## Changes
+
+- **v0.1.2-poc** (module `2026.10.06.2`):
+  - EL decoder no longer loses pictures (each EL access unit now ends with its RPU as in a demuxed EL
+    stream – before, the decoder timed out on some pictures, mostly at movie starts).
+  - Frames are no longer shown without EL every few seconds (RPU CRC pairing fix).
+  - No more freezes after fast seeks / chapter jumps and no more memory leak (video_composer repeat
+    frames).
+  - Direct display: the GPU writes the displayed frame, no AFBC re-compression (VICP B gone);
+    frames are taken from video_composer at the vsync (no double takes).
+  - "Sync playback to display" works (was ~260 dropped frames a minute: wrong refresh rate in Kodi's clock).
+  - The installer never replaces a newer kernel module with an older one; flickering after a seek and
+    1–2 fps after a direct file switch fixed.
+- **v0.1.1-poc**: one kernel module for all R24 firmware.
+- **v0.1.0-poc**: first release.
 
 ## License
 

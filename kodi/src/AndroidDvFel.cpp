@@ -63,6 +63,7 @@ constexpr int64_t EL_LEAD_US = 350000;
 constexpr size_t MAX_EL_FRAMES = 24;   // decoded EL frames kept (6 MB each at 4K)
 constexpr size_t MAX_EL_QUEUE = 400;   // compressed EL packets
 constexpr size_t MAX_CRC = 2048;       // packets waiting for their frame
+constexpr size_t MAX_META = 512;       // RPU mappings kept for frames without EL
 constexpr size_t CRC_SEARCH = 64;      // pending packets a frame may skip (dropped frames)
 constexpr int64_t PTS_TOLERANCE_US = 1000;
 
@@ -72,11 +73,15 @@ constexpr int64_t PTS_TOLERANCE_US = 1000;
 constexpr const char* HW_EL_CODEC = "OMX.amlogic.hevc.decoder.awesome2";
 constexpr int HW_EL_IMAGES = 2;
 constexpr int HW_EL_IMAGE_WAIT_MS = 40;
+// pictures counted as still in the decoder for the pool bound (pictures the
+// decoder drops as broken never come out)
+constexpr int64_t EL_IN_DECODER_MAX = 6;
 
 // files for tests, readable by the app (external storage)
 constexpr const char* SW_EL_FILE = "/sdcard/dvfel_sw_el";
 constexpr const char* DITHER_FILE = "/sdcard/dvfel_dither";
 constexpr const char* PATTERN_FILE = "/sdcard/dvfel_pattern";constexpr const char* DEMO_FILE = "/sdcard/dvfel_demo";
+constexpr const char* AFBC_OUT_FILE = "/sdcard/dvfel_afbc_out";
 // test: the base layer and the composed output of the first frame at or after
 // this time (ms) to /sdcard/dvfel_{in,out}_<hw|sw>_<pts us>.raw (packed words,
 // see dvfel_uapi.h)
@@ -242,17 +247,40 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
   return meta;
 }
 
-// rpu_data_crc32 of an RPU NAL unit (without start code), computed like the
-// dvfel kernel module: the 32 bits before the RBSP stop bit byte 0x80
+// NAL unit payload without the emulation prevention bytes (00 00 03)
+std::vector<uint8_t> Unescape(const uint8_t* nal, uint32_t size)
+{
+  std::vector<uint8_t> out;
+  out.reserve(size);
+  int zeros = 0;
+  for (uint32_t i = 0; i < size; i++)
+  {
+    const uint8_t b = nal[i];
+    if (zeros >= 2 && b == 3)
+    {
+      zeros = 0;
+      continue;
+    }
+    zeros = b ? 0 : zeros + 1;
+    out.push_back(b);
+  }
+  return out;
+}
+
+// rpu_data_crc32 of an RPU NAL unit (without start code) as the dvfel kernel
+// module reports it: the 32 bits before the RBSP stop bit byte 0x80. The
+// decoder hands the kernel the RPU already unescaped, and the module removes
+// 00 00 03 once more: a CRC that starts with 03 after two zero bytes comes as
+// 00..., so the same is done here.
 bool RpuTailCrc(const uint8_t* nal, uint32_t size, uint32_t& crc)
 {
+  const std::vector<uint8_t> rbsp = Unescape(nal, size);
   uint8_t win[5] = {}, last[5] = {};
   uint32_t n = 0;
   int zeros = 0;
   bool have = false;
-  for (uint32_t i = 0; i < size; i++)
+  for (const uint8_t b : rbsp)
   {
-    const uint8_t b = nal[i];
     if (zeros >= 2 && b == 3)
     {
       zeros = 0;
@@ -502,11 +530,14 @@ void CAndroidDvFel::InstallModuleAsync(const std::string& dir)
 {
   DeclinedFile(dir);
   std::thread([dir] {
-    // the bundled module is loaded already: nothing to do, no root needed
+    // the bundled module or a newer one (another Kodi FEL build installed it;
+    // versions are dates, YYYY.MM.DD) is loaded already: nothing to do, no
+    // root needed. Never replace a newer module with an older one.
     const std::string loaded = ReadLine("/sys/module/dvfel/version");
-    if (IsAvailable() && loaded == DVFEL_VERSION)
+    if (IsAvailable() && !loaded.empty() && loaded >= std::string(DVFEL_VERSION))
     {
-      CLog::Log(LOGINFO, "CAndroidDvFel: kernel module {} loaded", loaded);
+      CLog::Log(LOGINFO, "CAndroidDvFel: kernel module {} loaded (bundled {})", loaded,
+                DVFEL_VERSION);
       return;
     }
 
@@ -643,6 +674,7 @@ bool CAndroidDvFel::Start(int width, int height)
     m_elPoolBusy[i] = false;
   }
   m_stop = false;
+  m_noElBefore = INT64_MIN;
   m_noPairLogged = 0;
   m_noCrcLogged = 0;
 
@@ -691,9 +723,10 @@ void CAndroidDvFel::Stop()
     const auto slow = std::count_if(t.begin(), t.end(), [](float ms) { return ms > 41.7f; });
     CLog::Log(LOGINFO,
               "CAndroidDvFel: stopped, {} frames composed (gpu avg {:.1f} ms, median {:.1f}, p95 "
-              "{:.1f}, max {:.1f}, {} over 41.7 ms), {} shown without EL, {} EL frames decoded",
+              "{:.1f}, max {:.1f}, {} over 41.7 ms), {} shown without EL ({} without waiting, {} with the "
+              "mapping only), {} EL frames decoded",
               n, n ? m_gpuMsSum / n : 0.0, pct(0.5), pct(0.95), pct(1.0), slow,
-              m_passthrough.load(), m_elDecoded.load());
+              m_passthrough.load(), m_noElSkipped.load(), m_mappedOnly.load(), m_elDecoded.load());
     t.clear();
   }
 
@@ -703,6 +736,7 @@ void CAndroidDvFel::Stop()
   m_elFrames.clear();
   m_elQueue.clear();
   m_crcByPts.clear();
+  m_metaByPts.clear();
   // the EL pool, used by both threads
   for (int i = 0; i < EL_POOL; i++)
   {
@@ -731,6 +765,7 @@ void CAndroidDvFel::Reset()
   m_elQueue.clear();
   m_elQueue.push_back({0, {}, nullptr, true});
   m_crcByPts.clear();
+  m_metaByPts.clear();
   m_lastJobPts = INT64_MIN;
   m_noPairLogged = 0;
   m_noCrcLogged = 0;
@@ -786,8 +821,24 @@ void CAndroidDvFel::CommitPacket(double pts)
     while (m_crcByPts.size() > MAX_CRC)
       m_crcByPts.erase(m_crcByPts.begin());
   }
+  if (meta)
+  {
+    // for frames that get no EL (composed with the mapping only)
+    m_metaByPts[key] = meta;
+    while (m_metaByPts.size() > MAX_META)
+      m_metaByPts.erase(m_metaByPts.begin());
+  }
   if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
   {
+    // the RPU closes the EL access unit as in a demuxed EL stream: without a
+    // NAL unit after the last slice, the Amlogic HEVC decoder's back end times
+    // out (200 ms) on some pictures, and the pictures referencing them are lost
+    if (!m_pendingRpu.empty())
+    {
+      static const uint8_t startCode[] = {0, 0, 0, 1};
+      m_pendingEl.insert(m_pendingEl.end(), startCode, startCode + 4);
+      m_pendingEl.insert(m_pendingEl.end(), m_pendingRpu.begin(), m_pendingRpu.end());
+    }
     m_elQueue.push_back({key, std::move(m_pendingEl), meta, false});
     m_elCond.notify_all();
   }
@@ -875,6 +926,7 @@ void CAndroidDvFel::ElThread()
       for (auto& f : m_elFrames)
         ReleaseElFrame(f.second);
       m_elFrames.clear();
+      m_noElBefore = INT64_MAX; // until the first IRAP of the EL
       continue;
     }
 
@@ -887,6 +939,12 @@ void CAndroidDvFel::ElThread()
     if (type >= 16 && type <= 23) // IRAP: BLA 16-18, IDR 19-20, CRA 21
     {
       skipRasl = type <= 18 || (type == 21 && needIrap);
+      if (needIrap)
+      {
+        // frames shown before it (skipped leading pictures) get no EL
+        std::lock_guard<std::mutex> lock(m_lock);
+        m_noElBefore = in.pts;
+      }
       needIrap = false;
     }
     else if (needIrap || (skipRasl && (type == 8 || type == 9)))
@@ -1030,6 +1088,12 @@ void CAndroidDvFel::HwElThread()
   int64_t lastLabel = INT64_MIN;
   bool needIrap = true, skipRasl = false;
   uint64_t importErrors = 0, importUs = 0, imports = 0;
+  uint64_t staleImages = 0, lateImages = 0;
+  FILE* elDump = access("/sdcard/dvfel_eldump", F_OK) == 0 ? fopen("/sdcard/dvfel_eldump.bin", "wb") : nullptr;
+  int elDumped = 0;
+  int truncated = 0;
+  m_elInputs = 0;
+  m_elOutputs = 0;
 
   // a free EL pool buffer (m_lock held): frames the display has passed may go
   auto freeBuf = [this]() -> int {
@@ -1046,7 +1110,11 @@ void CAndroidDvFel::HwElThread()
     }
   };
 
-  // takes the decoded pictures out of the decoder; false while the pool is full
+  // takes the decoded pictures out of the decoder, always: an output the
+  // decoder cannot hand over stalls its back end, which times out (200 ms)
+  // and marks the picture and everything referencing it as broken until the
+  // next IRAP. With the pool full (should not happen with the pacing), the
+  // new picture (the farthest ahead) is dropped instead.
   auto drain = [&](int64_t timeoutUs) -> bool {
     while (!m_stop)
     {
@@ -1057,9 +1125,9 @@ void CAndroidDvFel::HwElThread()
         if (buf >= 0)
           m_elPoolBusy[buf] = true;
       }
-      if (buf < 0)
-        return false;
       auto unbusy = [&] {
+        if (buf < 0)
+          return;
         std::lock_guard<std::mutex> lock(m_lock);
         m_elPoolBusy[buf] = false;
       };
@@ -1076,17 +1144,38 @@ void CAndroidDvFel::HwElThread()
           continue;
         return true;
       }
-      AMediaCodec_releaseOutputBuffer(codec, o, true);
+      AMediaCodec_releaseOutputBuffer(codec, o, buf >= 0);
+      m_elOutputs++;
+      m_elLastOut = info.presentationTimeUs;
+      if (buf < 0 && m_elOverflow++ < 10)
+        CLog::Log(LOGINFO, "CAndroidDvFel: EL pool full, picture {} us dropped",
+                  info.presentationTimeUs);
 
-      // the picture as an image of the reader, decompressed into the pool
+      // the picture as an image of the reader (its timestamp is the buffer's
+      // presentation time): older images arrived late for an earlier output,
+      // whose picture is lost; they must not be taken for this one
       AImage* image = nullptr;
-      for (int i = 0; i < HW_EL_IMAGE_WAIT_MS && !m_stop; i++)
+      for (int i = 0; buf >= 0 && i < HW_EL_IMAGE_WAIT_MS && !m_stop && !image; i++)
       {
-        if (AImageReader_acquireNextImage(reader, &image) == AMEDIA_OK)
-          break;
-        image = nullptr;
-        usleep(1000);
+        if (AImageReader_acquireNextImage(reader, &image) != AMEDIA_OK)
+        {
+          image = nullptr;
+          usleep(1000);
+          continue;
+        }
+        int64_t ts = 0;
+        AImage_getTimestamp(image, &ts);
+        if (ts / 1000 != info.presentationTimeUs)
+        {
+          if (staleImages++ < 10)
+            CLog::Log(LOGINFO, "CAndroidDvFel: EL image {} us is not the output {} us, dropped",
+                      ts / 1000, info.presentationTimeUs);
+          AImage_delete(image);
+          image = nullptr;
+        }
       }
+      if (buf >= 0 && !image && lateImages++ < 10)
+        CLog::Log(LOGINFO, "CAndroidDvFel: no EL image for output {} us", info.presentationTimeUs);
       bool imported = false;
       if (image)
       {
@@ -1149,7 +1238,8 @@ void CAndroidDvFel::HwElThread()
       }
       if (!imported || !meta)
       {
-        m_elPoolBusy[buf] = false;
+        if (buf >= 0)
+          m_elPoolBusy[buf] = false;
         continue;
       }
       auto& entry = m_elFrames[pts];
@@ -1170,9 +1260,12 @@ void CAndroidDvFel::HwElThread()
       std::unique_lock<std::mutex> lock(m_lock);
       // pace decoding by the display, see ElThread; the pool bounds it too
       auto paced = [this] {
-        if (m_lastJobPts == INT64_MIN)
-          return m_elFrames.size() < EL_POOL;
-        return m_elFrames.empty() || m_elFrames.rbegin()->first < m_lastJobPts + EL_LEAD_US;
+        // the pictures still in the decoder need pool buffers too
+        const int64_t inDecoder = static_cast<int64_t>(m_elInputs) - static_cast<int64_t>(m_elOutputs);
+        if (static_cast<int64_t>(m_elFrames.size()) + std::clamp<int64_t>(inDecoder, 0, EL_IN_DECODER_MAX) >= EL_POOL)
+          return false;
+        return m_lastJobPts == INT64_MIN || m_elFrames.empty() ||
+               m_elFrames.rbegin()->first < m_lastJobPts + EL_LEAD_US;
       };
       m_elCond.wait_for(lock, std::chrono::milliseconds(5), [&] {
         return m_stop || (!m_elQueue.empty() && (m_elQueue.front().flush || paced()));
@@ -1195,6 +1288,7 @@ void CAndroidDvFel::HwElThread()
     if (in.flush)
     {
       AMediaCodec_flush(codec);
+      m_elOutputs = m_elInputs.load(); // the pictures in the decoder are gone
       // pictures released to the reader before the flush
       AImage* image = nullptr;
       while (AImageReader_acquireNextImage(reader, &image) == AMEDIA_OK)
@@ -1209,6 +1303,7 @@ void CAndroidDvFel::HwElThread()
       for (auto& f : m_elFrames)
         ReleaseElFrame(f.second);
       m_elFrames.clear();
+      m_noElBefore = INT64_MAX; // until the first IRAP of the EL
       continue;
     }
 
@@ -1221,6 +1316,12 @@ void CAndroidDvFel::HwElThread()
     if (type >= 16 && type <= 23) // IRAP: BLA 16-18, IDR 19-20, CRA 21
     {
       skipRasl = type <= 18 || (type == 21 && needIrap);
+      if (needIrap)
+      {
+        // frames shown before it (skipped leading pictures) get no EL
+        std::lock_guard<std::mutex> lock(m_lock);
+        m_noElBefore = in.pts;
+      }
       needIrap = false;
     }
     else if (needIrap || (skipRasl && (type == 8 || type == 9)))
@@ -1255,9 +1356,24 @@ void CAndroidDvFel::HwElThread()
     size_t cap = 0;
     uint8_t* p = AMediaCodec_getInputBuffer(codec, idx, &cap);
     const size_t size = std::min(cap, in.data.size());
+    if (in.data.size() > cap && truncated++ < 10)
+      CLog::Log(LOGWARNING, "CAndroidDvFel: EL picture {} us of {} bytes truncated to the input buffer ({} bytes)",
+                in.pts, in.data.size(), cap);
     if (p)
       std::memcpy(p, in.data.data(), size);
     AMediaCodec_queueInputBuffer(codec, idx, 0, p ? size : 0, static_cast<uint64_t>(in.pts), 0);
+    if (elDump && elDumped < 3000)
+    {
+      // test: /sdcard/dvfel_eldump exists: the packets as fed, each with a 4-byte size and 8-byte pts
+      const uint32_t n = static_cast<uint32_t>(size);
+      const int64_t t = in.pts;
+      fwrite(&n, 4, 1, elDump);
+      fwrite(&t, 8, 1, elDump);
+      fwrite(in.data.data(), 1, size, elDump);
+      if (++elDumped == 3000)
+        fclose(elDump), elDump = nullptr;
+    }
+    m_elInputs++;
     drain(0);
   }
 
@@ -1265,6 +1381,8 @@ void CAndroidDvFel::HwElThread()
                      "{:.1f} ms), {} import errors",
             imports, imports ? importUs / 1000.0 / imports : 0.0, importErrors);
   AMediaCodec_stop(codec);
+  if (elDump)
+    fclose(elDump);
   AMediaCodec_delete(codec);
   AImageReader_delete(reader);
   close(dev);
@@ -1282,19 +1400,40 @@ bool CAndroidDvFel::WaitForFrame(int64_t pts, ElFrame& el)
   }
   m_elCond.notify_all();
 
+  // no EL will come: shown before the first decodable EL picture (after a
+  // start or seek), or the EL (in display order) is past this frame already
+  auto never = [&] {
+    return (m_noElBefore != INT64_MIN && pts + PTS_TOLERANCE_US < m_noElBefore) ||
+           (!m_elFrames.empty() && m_elFrames.rbegin()->first > pts + PTS_TOLERANCE_US &&
+            FindPts(m_elFrames, pts) == m_elFrames.end());
+  };
+  if (never())
+  {
+    m_noElSkipped++;
+    return false;
+  }
   const bool found = m_readyCond.wait_for(lock, std::chrono::milliseconds(EL_WAIT_MS), [&] {
-    return m_stop || FindPts(m_elFrames, pts) != m_elFrames.end();
+    return m_stop || FindPts(m_elFrames, pts) != m_elFrames.end() || never();
   });
+  if (found && !m_stop && FindPts(m_elFrames, pts) == m_elFrames.end())
+  {
+    m_noElSkipped++;
+    return false;
+  }
   if (!found || m_stop)
   {
-    if (!m_stop && m_noPairLogged < 10)
+    if (!m_stop && m_noPairLogged < 40)
     {
       m_noPairLogged++;
       auto el = m_elFrames.lower_bound(pts);
-      CLog::Log(LOGINFO, "CAndroidDvFel: no EL for pts {} us: EL frames {} [{}..{}] next {}, EL queue {}",
+      CLog::Log(LOGINFO,
+                "CAndroidDvFel: no EL for pts {} us: EL frames {} [{}..{}] next {}, EL queue {}"
+                " (newest queued {}), decoder in {} out {} last out {}",
                 pts, m_elFrames.size(), m_elFrames.empty() ? 0 : m_elFrames.begin()->first,
                 m_elFrames.empty() ? 0 : m_elFrames.rbegin()->first,
-                el == m_elFrames.end() ? -1 : el->first, m_elQueue.size());
+                el == m_elFrames.end() ? -1 : el->first, m_elQueue.size(),
+                m_elQueue.empty() ? -1 : m_elQueue.back().pts, m_elInputs.load(),
+                m_elOutputs.load(), m_elLastOut.load());
     }
     return false;
   }
@@ -1326,12 +1465,25 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
   EGLDisplay dpy = EGL_NO_DISPLAY;
   EGLContext ctx = EGL_NO_CONTEXT;
   struct felgpu* fel = nullptr;
-  dvfel_reg_bufs reg{};
+  dvfel_reg_bufs2 reg2{};
+  dvfel_reg_bufs& reg = reg2.base;
   for (int i = 0; i < GPU_BUFFERS; i++)
     reg.in_fd[i] = reg.out_fd[i] = reg.el_fd[i] = -1;
+  for (int i = 0; i < DVFEL_MAX_OUT; i++)
+    reg2.lin_fd[i] = -1;
   GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{}, tel[EL_POOL]{};
-  EGLImageKHR images[GPU_BUFFERS * 2 + EL_POOL]{};
+  GLuint tlin[DVFEL_MAX_OUT]{}, flin[DVFEL_MAX_OUT]{};
+  EGLImageKHR images[GPU_BUFFERS * 2 + EL_POOL + DVFEL_MAX_OUT]{};
   int nimg = 0;
+  // the display shows the composed frames directly (module 2026.10.06.2+):
+  // one display buffer per kernel slot, the job names the one to write; no
+  // AFBC conversion (VICP) on the way to the display. Test: /sdcard/dvfel_afbc_out = 1
+  // keeps the old way (out[buf], converted to AFBC by the kernel).
+  const std::string modVersion = ReadLine("/sys/module/dvfel/version");
+  const int slots = std::atoi(ReadLine("/sys/module/dvfel/parameters/slots").c_str());
+  const bool linOut = modVersion >= std::string("2026.10.06.2") && slots >= 2 &&
+                      slots <= DVFEL_MAX_OUT && ReadIntFile(AFBC_OUT_FILE, 0) != 1;
+  const int nLin = linOut ? slots : 0;
 
   auto createImage = PFNEGLCREATEIMAGEKHRPROC(eglGetProcAddress("eglCreateImageKHR"));
   auto destroyImage = PFNEGLDESTROYIMAGEKHRPROC(eglGetProcAddress("eglDestroyImageKHR"));
@@ -1408,28 +1560,28 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
     reg.height = m_height;
     reg.count = GPU_BUFFERS;
     bool ok = true;
+    // a frame buffer the GPU writes: texture and framebuffer of a new ION buffer
+    auto outBuffer = [&](int& fd, GLuint& tex, GLuint& fbo) -> bool {
+      fd = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
+      tex = fd >= 0 ? importTex(fd, m_width, m_height) : 0;
+      if (!tex)
+        return false;
+      glGenFramebuffers(1, &fbo);
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+      return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    };
     for (int i = 0; i < GPU_BUFFERS && ok; i++)
     {
       reg.in_fd[i] = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
-      reg.out_fd[i] = IonAlloc(ion, heapId, DVFEL_BUF_SIZE(m_width, m_height));
-      ok = reg.in_fd[i] >= 0 && reg.out_fd[i] >= 0;
-      if (!ok)
-        CLog::Log(LOGERROR, "CAndroidDvFel: ION allocation of {} bytes from heap {} failed: {}",
-                  DVFEL_BUF_SIZE(m_width, m_height), heapId, strerror(errno));
-      if (ok)
-      {
-        tin[i] = importTex(reg.in_fd[i], m_width, m_height);
-        tout[i] = importTex(reg.out_fd[i], m_width, m_height);
-        ok = tin[i] && tout[i];
-      }
-      if (ok)
-      {
-        glGenFramebuffers(1, &fout[i]);
-        glBindFramebuffer(GL_FRAMEBUFFER, fout[i]);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tout[i], 0);
-        ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-      }
+      tin[i] = reg.in_fd[i] >= 0 ? importTex(reg.in_fd[i], m_width, m_height) : 0;
+      ok = tin[i] && (linOut || outBuffer(reg.out_fd[i], tout[i], fout[i]));
     }
+    for (int i = 0; i < nLin && ok; i++)
+      ok = outBuffer(reg2.lin_fd[i], tlin[i], flin[i]);
+    if (!ok)
+      CLog::Log(LOGERROR, "CAndroidDvFel: ION allocation of {} bytes from heap {} failed: {}",
+                DVFEL_BUF_SIZE(m_width, m_height), heapId, strerror(errno));
     // hardware EL: the pool the kernel decompresses the EL pictures into
     for (int i = 0; i < EL_POOL && ok && m_hwEl; i++)
     {
@@ -1448,15 +1600,18 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
     }
     glFinish();
     // routes the video composer through dvfel (kernel vc_path 2)
-    if (ioctl(dev, DVFEL_IOC_REG_BUFS, &reg) < 0)
+    reg2.out_count = nLin;
+    if ((linOut ? ioctl(dev, DVFEL_IOC_REG_BUFS2, &reg2) : ioctl(dev, DVFEL_IOC_REG_BUFS, &reg)) < 0)
     {
-      fail("DVFEL_IOC_REG_BUFS failed");
+      fail(linOut ? "DVFEL_IOC_REG_BUFS2 failed" : "DVFEL_IOC_REG_BUFS failed");
       break;
     }
     ready.set_value(true);
     announced = true;
-    CLog::Log(LOGINFO, "CAndroidDvFel: GPU compositor ready ({})",
-              reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+    CLog::Log(LOGINFO, "CAndroidDvFel: GPU compositor ready ({}), {}",
+              reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
+              linOut ? StringUtils::Format("{} display buffers (direct)", nLin)
+                     : std::string("AFBC display"));
 
     std::shared_ptr<felgpu_meta> current;
     int dither = -1, pattern = -1, demo = -1;
@@ -1505,10 +1660,24 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
       done.id = job.job.id;
       done.status = DVFEL_DONE_PASSTHROUGH;
 
+      // where the composed frame goes
+      GLuint target = 0;
+      int targetFd = -1;
+      if (linOut && job.out < static_cast<uint32_t>(nLin))
+      {
+        target = flin[job.out];
+        targetFd = reg2.lin_fd[job.out];
+      }
+      else if (!linOut && job.job.buf < GPU_BUFFERS)
+      {
+        target = fout[job.job.buf];
+        targetFd = reg.out_fd[job.job.buf];
+      }
+
       ElFrame el;
       bool haveEl = false;
       int64_t pts = -1;
-      if (job.job.buf < GPU_BUFFERS && !noGpu)
+      if (job.job.buf < GPU_BUFFERS && target && !noGpu)
       {
         pts = (job.job.flags & DVFEL_JOB_RPU_CRC) ? PtsForRpuCrc(job.rpu_crc) : -1;
         if (pts >= 0)
@@ -1517,9 +1686,12 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
         {
           m_noCrcLogged++;
           std::lock_guard<std::mutex> lock(m_lock);
+          std::string pending;
+          for (auto it = m_crcByPts.begin(); it != m_crcByPts.end() && pending.size() < 80; ++it)
+            pending += StringUtils::Format(" {}:{:08x}", it->first / 1000, it->second);
           CLog::Log(LOGINFO, "CAndroidDvFel: frame {} (rpu crc {:08x}, flags {:#x}) matches no packet "
-                             "(pending {})",
-                    job.seq, job.rpu_crc, job.job.flags, m_crcByPts.size());
+                             "(pending {}:{})",
+                    job.seq, job.rpu_crc, job.job.flags, m_crcByPts.size(), pending);
         }
       }
 
@@ -1542,7 +1714,7 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
                         reinterpret_cast<const uint16_t*>(f->data[1]),
                         reinterpret_cast<const uint16_t*>(f->data[2]), f->linesize[1] / 2);
         }
-        felgpu_run(fel, tin[job.job.buf], fout[job.job.buf]);
+        felgpu_run(fel, tin[job.job.buf], target);
         glFinish();
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1557,7 +1729,7 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
           const size_t size = static_cast<size_t>(m_width) * m_height * 4;
           for (const char* what : {"in", "out"})
           {
-            const int fd = what[0] == 'i' ? reg.in_fd[job.job.buf] : reg.out_fd[job.job.buf];
+            const int fd = what[0] == 'i' ? reg.in_fd[job.job.buf] : targetFd;
             void* p = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
             const std::string name = StringUtils::Format("/sdcard/dvfel_{}_{}_{}.raw", what,
                                                          el.buf >= 0 ? "hw" : "sw", pts);
@@ -1575,6 +1747,28 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
       }
       else
       {
+        // no EL (e.g. the leading pictures after a seek): the frame's own
+        // mapping without the residual looks close to its neighbours, the
+        // base layer as is would flash
+        std::shared_ptr<felgpu_meta> meta;
+        if (pts >= 0)
+        {
+          std::lock_guard<std::mutex> lock(m_lock);
+          auto m = FindPts(m_metaByPts, pts);
+          if (m != m_metaByPts.end())
+            meta = m->second;
+        }
+        if (meta)
+        {
+          felgpu_meta mapping = *meta;
+          mapping.use_el = 0;
+          felgpu_set_meta(fel, &mapping);
+          current = nullptr;
+          felgpu_run(fel, tin[job.job.buf], target);
+          glFinish();
+          done.status = DVFEL_DONE_COMPOSED;
+          m_mappedOnly++;
+        }
         m_passthrough++;
       }
       {
@@ -1595,8 +1789,10 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
   if (ctx != EGL_NO_CONTEXT)
   {
     glDeleteFramebuffers(GPU_BUFFERS, fout);
+    glDeleteFramebuffers(DVFEL_MAX_OUT, flin);
     glDeleteTextures(GPU_BUFFERS, tin);
     glDeleteTextures(GPU_BUFFERS, tout);
+    glDeleteTextures(DVFEL_MAX_OUT, tlin);
     glDeleteTextures(EL_POOL, tel);
     for (int i = 0; i < nimg; i++)
       destroyImage(dpy, images[i]);
@@ -1610,6 +1806,9 @@ void CAndroidDvFel::GpuThread(std::promise<bool> ready)
     if (reg.out_fd[i] >= 0)
       close(reg.out_fd[i]);
   }
+  for (int i = 0; i < DVFEL_MAX_OUT; i++)
+    if (reg2.lin_fd[i] >= 0)
+      close(reg2.lin_fd[i]);
   if (ion >= 0)
     close(ion);
   if (!announced)

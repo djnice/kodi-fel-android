@@ -34,8 +34,12 @@ Releases: <https://github.com/djnice/kodi-fel-android/releases> (APK, read `READ
   `250815_1012_r22`. One module build for all of them (no symbol version differences between these two);
   on other builds / models please report how it works (kodi.log `CAndroidDvFel` lines – they also list
   kernel symbols whose versions differ from the tested firmware).
-- Root access for the one-time module installation (the firmware's `sud`; Kodi FEL asks to switch it on
-  for the installation and switches it off again).
+- **R25** firmware: it ships the `dvfel` module itself (firmware plugin `s928x_dvfel`, loaded at every
+  boot). Kodi FEL uses that module as it is and installs nothing (no root needed). Tested 2026-10-25 with
+  v0.1.3-poc on a Dune HD Pro 8K Plus, firmware `20261020_r25` with the plugin updated to module
+  `2026.10.23.3`: FEL composition with the hardware EL decoder, 2128 frames composed, 1 without EL.
+- R22 / R24: root access for the one-time module installation (the firmware's `sud`; Kodi FEL asks to
+  switch it on for the installation and switches it off again).
 
 ## How the module gets installed
 
@@ -50,6 +54,11 @@ its assets (`system/dvfel/`). On start, if the module is not loaded (or older):
 3. The module goes to `<FS_PREFIX>/config/dvfel/dvfel.ko` and a boot script to
    `<FS_PREFIX>/config/boot/dvfel.sh`, which the firmware runs as root at every boot (R24: `binit.sh`,
    R22: the `dunehd_init` service script `/system/xbin/dunehd/init` itself).
+
+On R25 the bundled module (`2026.10.06.2`) is older than the firmware's, so none of this happens; the
+firmware plugin also removes an earlier `config/boot/dvfel.sh` at boot. Updated firmware modules (Dune
+plugin zips `dune_plugin_s928x_dvfel-*.zip`, installed from the Dune file browser) are published with
+the VLC FEL releases: <https://github.com/djnice/vlc-fel-android/releases>.
 
 ## Repository
 

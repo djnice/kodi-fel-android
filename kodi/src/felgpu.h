@@ -1,4 +1,10 @@
 /*
+ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
+ *
+ *  SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+/*
  * felgpu - Dolby Vision FEL composition on OpenGL ES 3.2
  *
  * Composes a decoded base layer (dvfel linear 10-bit 4:4:4 buffer, see

@@ -1,3 +1,9 @@
+/*
+ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
+ *
+ *  SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

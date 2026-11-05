@@ -108,5 +108,8 @@ the VLC FEL releases: <https://github.com/djnice/vlc-fel-android/releases>.
 
 ## License
 
-GPL-2.0-or-later (Kodi and the kernel module). Dolby Vision is a trademark of Dolby Laboratories; this
+GPL-2.0-or-later (Kodi and the kernel module). The dvfel kernel module and the FEL composition sources
+(`AndroidDvFel`, `felgpu`) are Copyright (C) 2026 djnice. Redistribution, also in firmware or in other
+products, must keep the copyright and license notices and provide the complete corresponding source code as
+the GPL requires. Dolby Vision is a trademark of Dolby Laboratories; this
 project is not affiliated with Dolby, Dune HD, R_volution or the Kodi Foundation.

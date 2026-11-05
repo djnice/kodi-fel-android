@@ -1,4 +1,5 @@
 /*
+ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
  *  Copyright (C) 2026 Team CoreELEC
  *  This file is part of Kodi - https://kodi.tv
  *

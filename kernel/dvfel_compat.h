@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /*
  * dvfel - differences of the Amlogic 5.4 GKI media API (Android, e.g. the
  * Dune HD Pro One 8K Plus firmware) against the 5.15 common_drivers API.
